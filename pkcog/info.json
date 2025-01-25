@@ -9,7 +9,7 @@
   "min_bot_version": "3.3.10",
   "name": "pkcog",
   "permissions": [],
-  "required_cogs": [],
+  "required_cogs": {},
   "requirements": [],
   "short": "a Pluralkit backup for Red",
   "tags": [ "utility", "pluralkit" ],
