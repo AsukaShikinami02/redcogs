@@ -65,7 +65,7 @@ class PluralKitIntegration(commands.Cog):
             raise Exception(f"Error fetching members: {e}")
 
     @commands.command()
-    async def import_members(self, ctx, system_id: str):
+    async def import(self, ctx, system_id: str):
         """Import or update PluralKit members, including avatar updates."""
         try:
             # Fetch the latest members from PluralKit
@@ -119,7 +119,7 @@ class PluralKitIntegration(commands.Cog):
             await ctx.send(f"Error importing members: {e}")
 
     @commands.command()
-    async def proxy_message(self, ctx, member_name: str, *, message: str):
+    async def proxy(self, ctx, member_name: str, *, message: str):
         """Send a message using a member's proxy and delete the command message."""
         member = next((m for m in self.members.values() if m["name"].lower() == member_name.lower()), None)
         if not member:
