@@ -65,7 +65,7 @@ class PluralKitIntegration(commands.Cog):
             raise Exception(f"Error fetching members: {e}")
 
     @commands.command()
-    async def import(self, ctx, system_id: str):
+    async def pkimport(self, ctx, system_id: str):
         """Import or update PluralKit members, including avatar updates."""
         try:
             # Fetch the latest members from PluralKit
