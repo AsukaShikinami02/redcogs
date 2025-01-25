@@ -9,7 +9,7 @@
   "min_bot_version": "3.3.10",
   "name": "AsuCogs",
   "permissions": [],
-  "required_cogs": [],
+  "required_cogs": {},
   "requirements": [],
   "short": "Some cogs I'm making",
   "tags": [ "utility", "pluralkit" ],
