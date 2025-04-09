@@ -68,71 +68,71 @@ class RedRadio(commands.Cog):
     
     @commands.command()
     async def searchstations(self, ctx, *, query: str):
-            url = f"https://de2.api.radio-browser.info/json/stations/byname/{query}"
-            async with self.session.get(url) as resp:
-                if resp.status != 200:
-                    await ctx.send("Failed to fetch stations.")
-                    return
-                self.stations = await resp.json()
-        
-            if not self.stations:
-                await ctx.send("No stations found.")
+        url = f"https://de2.api.radio-browser.info/json/stations/byname/{query}"
+        async with self.session.get(url) as resp:
+            if resp.status != 200:
+                await ctx.send("Failed to fetch stations.")
                 return
-        
-            self.stations = self.stations[:50]  # Limit to 50 results max
-            pages = [self.stations[i:i + 10] for i in range(0, len(self.stations), 10)]
-            total_pages = len(pages)
-            current_page = 0
-        
-            def make_embed(page_num):
-               embed = discord.Embed(
-                    title=f"🔎 Results for '{query}' (Page {page_num + 1}/{total_pages})",
-                    color=discord.Color.green()
-                )
-            for i, s in enumerate(pages[page_num], start=page_num * 10 + 1):
-                    tags = s['tags'][:100] if s['tags'] else 'No tags'
-                    if len(tags) > 100:
-                        tags = tags[:97] + '...'
-                    field_name = f"{i}. {s['name']} ({s['country']})"
-                    field_value = f"Bitrate: {s['bitrate']} kbps\nTags: {tags}"
-                    embed.add_field(name=field_name[:256], value=field_value[:1024], inline=False)
-                    embed.set_footer(text="Use AS!playstation <number> to play.")
+            self.stations = await resp.json()
+    
+        if not self.stations:
+            await ctx.send("No stations found.")
+            return
+    
+        self.stations = self.stations[:50]  # Limit to 50 results
+        pages = [self.stations[i:i + 10] for i in range(0, len(self.stations), 10)]
+        total_pages = len(pages)
+        current_page = 0
+    
+        def make_embed(current):
+            embed = discord.Embed(
+                title=f"🔎 Results for '{query}' (Page {current + 1}/{total_pages})",
+                color=discord.Color.green()
+            )
+            for i, s in enumerate(pages[current], start=current * 10 + 1):
+                tags = s['tags'] or 'No tags'
+                if len(tags) > 100:
+                    tags = tags[:97] + '...'
+                name = f"{i}. {s['name']} ({s['country']})"
+                value = f"Bitrate: {s['bitrate']} kbps\nTags: {tags}"
+                embed.add_field(name=name[:256], value=value[:1024], inline=False)
+            embed.set_footer(text="Use AS!playstation <number> to play.")
             return embed
     
-        
-            message = await ctx.send(embed=make_embed(current_page))
-            reactions = ["⏮️", "◀️", "▶️", "⏭️"]
-            for r in reactions:
-                await message.add_reaction(r)
-        
-            def check(reaction, user):
-                return (
-                    user == ctx.author
-                    and reaction.message.id == message.id
-                    and str(reaction.emoji) in reactions
-                )
-        
-            while True:
-                try:
-                    reaction, user = await self.bot.wait_for("reaction_add", timeout=60.0, check=check)
-                    emoji = str(reaction.emoji)
-                    if emoji == "⏮️":
-                        current_page = 0
-                    elif emoji == "◀️" and current_page > 0:
-                        current_page -= 1
-                    elif emoji == "▶️" and current_page < total_pages - 1:
-                        current_page += 1
-                    elif emoji == "⏭️":
-                        current_page = total_pages - 1
-                    await message.edit(embed=make_embed(current_page))
-                    await message.remove_reaction(reaction, user)
-                except asyncio.TimeoutError:
-                    break
-        
+        message = await ctx.send(embed=make_embed(current_page))
+        reactions = ["⏮️", "◀️", "▶️", "⏭️"]
+        for r in reactions:
+            await message.add_reaction(r)
+    
+        def check(reaction, user):
+            return (
+                user == ctx.author
+                and reaction.message.id == message.id
+                and str(reaction.emoji) in reactions
+            )
+    
+        while True:
             try:
-                await message.clear_reactions()
-            except discord.Forbidden:
-                pass
+                reaction, user = await self.bot.wait_for("reaction_add", timeout=60.0, check=check)
+                emoji = str(reaction.emoji)
+                if emoji == "⏮️":
+                    current_page = 0
+                elif emoji == "◀️" and current_page > 0:
+                    current_page -= 1
+                elif emoji == "▶️" and current_page < total_pages - 1:
+                    current_page += 1
+                elif emoji == "⏭️":
+                    current_page = total_pages - 1
+                await message.edit(embed=make_embed(current_page))
+                await message.remove_reaction(reaction, user)
+            except asyncio.TimeoutError:
+                break
+    
+        try:
+            await message.clear_reactions()
+        except discord.Forbidden:
+            pass
+
     
     @commands.command()
     async def playstation(self, ctx, index: int):
