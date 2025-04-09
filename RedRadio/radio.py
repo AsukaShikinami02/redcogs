@@ -14,7 +14,7 @@ class RedRadio(commands.Cog):
         self.config = Config.get_conf(self, identifier=90210, force_registration=True)
         self.config.register_guild(stream_url=None, track_channel=None)
         self.stations = []
-        self.last_title = None
+        self.last_title = {}
         self.track_task = self.bot.loop.create_task(self.trackinfo_loop())
 
     def cog_unload(self):
@@ -146,10 +146,11 @@ class RedRadio(commands.Cog):
                     artist = metadata.get("artist")
                     title = metadata.get("title")
 
-                    if not title or title == self.last_title:
+                    if not title or self.last_title.get(guild.id) == title:
                         continue
-
-                    self.last_title = title
+                    
+                    self.last_title[guild.id] = title
+                    
 
                     embed = discord.Embed(
                         title="🎶 Now Playing",
