@@ -27,21 +27,30 @@ class RedRadio(commands.Cog):
         headers = {"Icy-MetaData": "1", "User-Agent": "Mozilla/5.0"}
         try:
             async with self.session.get(stream_url, headers=headers, timeout=10) as resp:
+                print(f"[DEBUG] Response headers: {resp.headers}")
                 metaint = int(resp.headers.get("icy-metaint", 0))
                 if metaint == 0:
+                    print("[DEBUG] No icy-metaint found — no metadata in this stream.")
                     return None
-                raw = await resp.content.read(metaint + 1024)  # smaller read size
+
+                raw = await resp.content.read(metaint + 1024)
+                print(f"[DEBUG] Raw length: {len(raw)}, Expected at least: {metaint + 1}")
                 metadata_offset = metaint
 
                 if len(raw) < metadata_offset + 1:
-                    return None  # not enough data to read metadata length
+                    print("[DEBUG] Not enough data to read metadata length byte.")
+                    return None
 
                 metadata_length = raw[metadata_offset] * 16
+                print(f"[DEBUG] Metadata length: {metadata_length}")
 
                 if len(raw) < metadata_offset + 1 + metadata_length:
-                    return None  # not enough metadata bytes
+                    print("[DEBUG] Not enough metadata bytes to parse content.")
+                    return None
 
                 metadata_content = raw[metadata_offset + 1:metadata_offset + 1 + metadata_length].decode("utf-8", errors="ignore")
+                print(f"[DEBUG] Metadata content: {metadata_content}")
+
                 match = re.search(r"StreamTitle='(.*?)';", metadata_content)
                 if match:
                     title = match.group(1).strip()
