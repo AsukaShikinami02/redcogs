@@ -1,12 +1,12 @@
 import discord
-from redbot.core import commands, apis
+from redbot.core import commands
 import aiohttp
 import asyncio
 import re
 import urllib.parse
 
 class RedRadio(commands.Cog):
-    """Radio streaming cog with track info and album art."""
+    """Radio streaming cog with track info from ICY metadata."""
 
     def __init__(self, bot):
         self.bot = bot
@@ -14,16 +14,13 @@ class RedRadio(commands.Cog):
         self.stations = []
         self.track_channel = None
         self.last_title = None
-        self.lastfm_api_key = None
+        self.current_stream_url = None
         self.track_task = self.bot.loop.create_task(self.trackinfo_loop())
 
     def cog_unload(self):
         if self.track_task:
             self.track_task.cancel()
         self.bot.loop.create_task(self.session.close())
-
-    async def cog_load(self):
-        self.lastfm_api_key = await apis.get_api_key(self.bot, "radio", "lastfm")
 
     async def get_stream_metadata(self, stream_url):
         headers = {"Icy-MetaData": "1", "User-Agent": "Mozilla/5.0"}
@@ -47,37 +44,6 @@ class RedRadio(commands.Cog):
         except Exception as e:
             print(f"[Metadata] Failed to get ICY metadata: {e}")
         return None
-
-    async def get_metadata_from_lastfm(self, artist, title):
-        if not artist or not title:
-            return None
-        if not self.lastfm_api_key:
-            return None
-        params = {
-            "method": "track.getInfo",
-            "api_key": self.lastfm_api_key,
-            "artist": artist,
-            "track": title,
-            "format": "json"
-        }
-        url = "http://ws.audioscrobbler.com/2.0/?" + urllib.parse.urlencode(params)
-        try:
-            async with self.session.get(url) as resp:
-                data = await resp.json()
-                track = data.get("track")
-                if not track:
-                    return None
-                album = track.get("album", {})
-                image = next((img["#text"] for img in album.get("image", [])[::-1] if img["#text"]), None)
-                return {
-                    "title": track.get("name"),
-                    "artist": track.get("artist", {}).get("name"),
-                    "album": album.get("title"),
-                    "image": image
-                }
-        except Exception as e:
-            print(f"[LastFM] Error: {e}")
-            return None
 
     @commands.command()
     async def searchstations(self, ctx, *, query: str):
@@ -125,6 +91,7 @@ class RedRadio(commands.Cog):
         await ctx.invoke(play_cmd, query=stream_url)
 
         self.track_channel = ctx.channel
+        self.current_stream_url = stream_url
         self.last_title = None
 
         embed = discord.Embed(
@@ -142,6 +109,7 @@ class RedRadio(commands.Cog):
             await ctx.send("❌ Stop command not found.")
             return
         await ctx.invoke(stop_cmd)
+        self.current_stream_url = None
         await ctx.send(embed=discord.Embed(
             title="⏹️ Stopped",
             description="The radio stream has been stopped.",
@@ -151,62 +119,29 @@ class RedRadio(commands.Cog):
     async def trackinfo_loop(self):
         await self.bot.wait_until_ready()
         while self.bot.is_ready():
-            await asyncio.sleep(10)
-            if not self.track_channel:
+            await asyncio.sleep(30)
+            if not self.track_channel or not self.current_stream_url:
                 continue
             try:
-                np_cmd = self.bot.get_command("np")
-                if not np_cmd:
-                    continue
-
-                msg = await self.track_channel.send("⏳ Fetching metadata...")
-                ctx_fake = await self.bot.get_context(msg)
-                await np_cmd.invoke(ctx_fake)
-
-                history = [m async for m in self.track_channel.history(limit=5)]
-                for m in history:
-                    if m.author == self.bot.user and m.id != msg.id:
-                        raw_text = m.content
-                        await m.delete()
-                        break
-                else:
-                    await msg.delete()
-                    continue
-
-                stream_url_match = re.search(r"https?://[^\s]+", raw_text)
-                if not stream_url_match:
-                    await msg.delete()
-                    continue
-
-                stream_url = stream_url_match.group(0)
-                metadata = await self.get_stream_metadata(stream_url)
-
+                metadata = await self.get_stream_metadata(self.current_stream_url)
                 if not metadata:
-                    await msg.delete()
                     continue
 
                 artist = metadata.get("artist")
                 title = metadata.get("title")
 
                 if not title or title == self.last_title:
-                    await msg.delete()
                     continue
 
                 self.last_title = title
-                meta = await self.get_metadata_from_lastfm(artist, title)
 
                 embed = discord.Embed(
                     title="🎶 Now Playing",
                     description=f"**{title}** by **{artist}**" if artist else title,
                     color=discord.Color.teal()
                 )
-                if meta and meta.get("image"):
-                    embed.set_thumbnail(url=meta["image"])
-                if meta and meta.get("album"):
-                    embed.add_field(name="Album", value=meta["album"], inline=True)
 
                 await self.track_channel.send(embed=embed)
-                await msg.delete()
 
             except Exception as e:
                 print(f"[Radio TrackInfo Loop] Error: {e}")
