@@ -24,46 +24,46 @@ class RedRadio(commands.Cog):
         self.bot.loop.create_task(self.session.close())
 
     async def get_stream_metadata(self, stream_url):
-    headers = {"Icy-MetaData": "1", "User-Agent": "Mozilla/5.0"}
-    try:
-        async with self.session.get(stream_url, headers=headers, timeout=10) as resp:
-            metaint = int(resp.headers.get("icy-metaint", 0))
-            if metaint == 0:
-                print("[DEBUG] No icy-metaint found — no metadata in this stream.")
-                return None
-
-            # Read exactly enough bytes to get metadata
-            buffer = b""
-            while len(buffer) < metaint + 256:
-                chunk = await resp.content.read(metaint + 256 - len(buffer))
-                if not chunk:
-                    break
-                buffer += chunk
-
-            if len(buffer) < metaint + 1:
-                print("[DEBUG] Not enough data to read metadata length byte.")
-                return None
-
-            metadata_length = buffer[metaint] * 16
-            if len(buffer) < metaint + 1 + metadata_length:
-                print("[DEBUG] Not enough metadata bytes to parse content.")
-                return None
-
-            metadata_content = buffer[metaint + 1:metaint + 1 + metadata_length].decode("utf-8", errors="ignore")
-            print(f"[DEBUG] Metadata content: {metadata_content}")
-
-            match = re.search(r"StreamTitle='(.*?)';", metadata_content)
-            if match:
-                title = match.group(1).strip()
-                if " - " in title:
-                    artist, song = title.split(" - ", 1)
-                else:
-                    artist, song = None, title
-                return {"title": song.strip(), "artist": artist.strip() if artist else None}
-        except Exception as e:
-            print(f"[Metadata] Failed to get ICY metadata: {e}")
-        return None
-        
+        headers = {"Icy-MetaData": "1", "User-Agent": "Mozilla/5.0"}
+        try:
+            async with self.session.get(stream_url, headers=headers, timeout=10) as resp:
+                metaint = int(resp.headers.get("icy-metaint", 0))
+                if metaint == 0:
+                    print("[DEBUG] No icy-metaint found — no metadata in this stream.")
+                    return None
+    
+                # Read exactly enough bytes to get metadata
+                buffer = b""
+                while len(buffer) < metaint + 256:
+                    chunk = await resp.content.read(metaint + 256 - len(buffer))
+                    if not chunk:
+                        break
+                    buffer += chunk
+    
+                if len(buffer) < metaint + 1:
+                    print("[DEBUG] Not enough data to read metadata length byte.")
+                    return None
+    
+                metadata_length = buffer[metaint] * 16
+                if len(buffer) < metaint + 1 + metadata_length:
+                    print("[DEBUG] Not enough metadata bytes to parse content.")
+                    return None
+    
+                metadata_content = buffer[metaint + 1:metaint + 1 + metadata_length].decode("utf-8", errors="ignore")
+                print(f"[DEBUG] Metadata content: {metadata_content}")
+    
+                match = re.search(r"StreamTitle='(.*?)';", metadata_content)
+                if match:
+                    title = match.group(1).strip()
+                    if " - " in title:
+                        artist, song = title.split(" - ", 1)
+                    else:
+                        artist, song = None, title
+                    return {"title": song.strip(), "artist": artist.strip() if artist else None}
+         except Exception as e:
+                print(f"[Metadata] Failed to get ICY metadata: {e}")
+         return None
+            
 
 
     @commands.command()
