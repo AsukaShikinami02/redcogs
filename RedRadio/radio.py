@@ -96,7 +96,7 @@ class RedRadio(commands.Cog):
                     field_name = f"{i}. {s['name']} ({s['country']})"
                     field_value = f"Bitrate: {s['bitrate']} kbps\nTags: {tags}"
                     embed.add_field(name=field_name[:256], value=field_value[:1024], inline=False)
-                embed.set_footer(text="Use AS!playstation <number> to play.")
+                    embed.set_footer(text="Use AS!playstation <number> to play.")
             return embed
     
         
