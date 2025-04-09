@@ -55,7 +55,7 @@ class RedRadio(commands.Cog):
 
     @commands.command()
     async def searchstations(self, ctx, *, query: str):
-        url = f"https://de1.api.radio-browser.info/json/stations/byname/{query}"
+        url = f"https://de2.api.radio-browser.info/json/stations/byname/{query}"
         async with self.session.get(url) as resp:
             if resp.status != 200:
                 await ctx.send("Failed to fetch stations.")
