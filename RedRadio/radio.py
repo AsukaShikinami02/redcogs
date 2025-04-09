@@ -4,6 +4,7 @@ import aiohttp
 import asyncio
 import re
 import urllib.parse
+import datetime
 
 class RedRadio(commands.Cog):
     """Radio streaming cog with track info from ICY metadata."""
@@ -29,7 +30,7 @@ class RedRadio(commands.Cog):
                 metaint = int(resp.headers.get("icy-metaint", 0))
                 if metaint == 0:
                     return None
-                raw = await resp.content.read(metaint + 4080)
+                raw = await resp.content.read(metaint + 1024)  # smaller read size
                 metadata_offset = metaint
 
                 if len(raw) < metadata_offset + 1:
@@ -55,7 +56,7 @@ class RedRadio(commands.Cog):
 
     @commands.command()
     async def searchstations(self, ctx, *, query: str):
-        url = f"https://de2.api.radio-browser.info/json/stations/byname/{query}"
+        url = f"https://de2.api.radio-browser.info/json/stations/byname{query"
         async with self.session.get(url) as resp:
             if resp.status != 200:
                 await ctx.send("Failed to fetch stations.")
@@ -78,7 +79,7 @@ class RedRadio(commands.Cog):
     @commands.command()
     async def playstation(self, ctx, index: int):
         if not self.stations:
-            await ctx.send("Please use `AS!searchstations` first.")
+            await ctx.send("Please use `!searchstations` first.")
             return
         if index < 1 or index > len(self.stations):
             await ctx.send("Invalid station number.")
@@ -107,7 +108,7 @@ class RedRadio(commands.Cog):
             description=f"🎧 Country: {station['country']}\n🔗 [Stream Link]({stream_url})",
             color=discord.Color.blurple()
         )
-        embed.set_footer(text="Use !stopstation to stop playback.")
+        embed.set_footer(text="Use AS!stopstation to stop playback.")
         await ctx.send(embed=embed)
 
     @commands.command()
@@ -127,7 +128,9 @@ class RedRadio(commands.Cog):
     async def trackinfo_loop(self):
         await self.bot.wait_until_ready()
         while self.bot.is_ready():
-            await asyncio.sleep(1)  # check every 10 seconds instead of 30
+            print(f"[{datetime.datetime.now()}] Sleeping for 10 seconds...")
+            await asyncio.sleep(10)  # check every 10 seconds
+            print(f"[{datetime.datetime.now()}] Checking metadata...")
             for guild in self.bot.guilds:
                 try:
                     stream_url = await self.config.guild(guild).stream_url()
