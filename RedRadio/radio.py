@@ -64,7 +64,6 @@ class RedRadio(commands.Cog):
                 print(f"[Metadata] Failed to get ICY metadata: {e}")
         return None
             
-
     @commands.command()
     async def searchstations(self, ctx, *, query: str):
         url = f"https://de2.api.radio-browser.info/json/stations/byname/{query}"
@@ -134,6 +133,7 @@ class RedRadio(commands.Cog):
             pass
     
 
+    
     @commands.command()
     async def playstation(self, ctx, index: int):
         if not self.stations:
