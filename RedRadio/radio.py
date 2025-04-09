@@ -1,5 +1,5 @@
 import discord
-from redbot.core import commands
+from redbot.core import commands, Config
 import aiohttp
 import asyncio
 import re
@@ -11,10 +11,10 @@ class RedRadio(commands.Cog):
     def __init__(self, bot):
         self.bot = bot
         self.session = aiohttp.ClientSession()
+        self.config = Config.get_conf(self, identifier=90210, force_registration=True)
+        self.config.register_guild(stream_url=None, track_channel=None)
         self.stations = []
-        self.track_channel = None
         self.last_title = None
-        self.current_stream_url = None
         self.track_task = self.bot.loop.create_task(self.trackinfo_loop())
 
     def cog_unload(self):
@@ -90,8 +90,8 @@ class RedRadio(commands.Cog):
 
         await ctx.invoke(play_cmd, query=stream_url)
 
-        self.track_channel = ctx.channel
-        self.current_stream_url = stream_url
+        await self.config.guild(ctx.guild).track_channel.set(ctx.channel.id)
+        await self.config.guild(ctx.guild).stream_url.set(stream_url)
         self.last_title = None
 
         embed = discord.Embed(
@@ -109,7 +109,7 @@ class RedRadio(commands.Cog):
             await ctx.send("❌ Stop command not found.")
             return
         await ctx.invoke(stop_cmd)
-        self.current_stream_url = None
+        await self.config.guild(ctx.guild).stream_url.set(None)
         await ctx.send(embed=discord.Embed(
             title="⏹️ Stopped",
             description="The radio stream has been stopped.",
@@ -120,28 +120,36 @@ class RedRadio(commands.Cog):
         await self.bot.wait_until_ready()
         while self.bot.is_ready():
             await asyncio.sleep(30)
-            if not self.track_channel or not self.current_stream_url:
-                continue
-            try:
-                metadata = await self.get_stream_metadata(self.current_stream_url)
-                if not metadata:
-                    continue
+            for guild in self.bot.guilds:
+                try:
+                    stream_url = await self.config.guild(guild).stream_url()
+                    channel_id = await self.config.guild(guild).track_channel()
+                    if not stream_url or not channel_id:
+                        continue
 
-                artist = metadata.get("artist")
-                title = metadata.get("title")
+                    channel = guild.get_channel(channel_id)
+                    if not channel:
+                        continue
 
-                if not title or title == self.last_title:
-                    continue
+                    metadata = await self.get_stream_metadata(stream_url)
+                    if not metadata:
+                        continue
 
-                self.last_title = title
+                    artist = metadata.get("artist")
+                    title = metadata.get("title")
 
-                embed = discord.Embed(
-                    title="🎶 Now Playing",
-                    description=f"**{title}** by **{artist}**" if artist else title,
-                    color=discord.Color.teal()
-                )
+                    if not title or title == self.last_title:
+                        continue
 
-                await self.track_channel.send(embed=embed)
+                    self.last_title = title
 
-            except Exception as e:
-                print(f"[Radio TrackInfo Loop] Error: {e}")
+                    embed = discord.Embed(
+                        title="🎶 Now Playing",
+                        description=f"**{title}** by **{artist}**" if artist else title,
+                        color=discord.Color.teal()
+                    )
+
+                    await channel.send(embed=embed)
+
+                except Exception as e:
+                    print(f"[Radio TrackInfo Loop] Error in guild {guild.id}: {e}")
