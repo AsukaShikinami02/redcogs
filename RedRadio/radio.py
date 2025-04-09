@@ -60,9 +60,9 @@ class RedRadio(commands.Cog):
                     else:
                         artist, song = None, title
                     return {"title": song.strip(), "artist": artist.strip() if artist else None}
-         except Exception as e:
+        except Exception as e:
                 print(f"[Metadata] Failed to get ICY metadata: {e}")
-         return None
+        return None
             
 
 
