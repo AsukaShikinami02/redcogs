@@ -7,7 +7,7 @@ import urllib.parse
 
 LASTFM_API_KEY = "067585eb2f42693ad00de3bbd2fda02a"
 
-class Radio(commands.Cog):
+class RedRadio(commands.Cog):
     """Radio streaming cog with track info and album art."""
 
     def __init__(self, bot):
