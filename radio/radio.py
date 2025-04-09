@@ -1,5 +1,5 @@
 import discord
-from redbot.core import commands, audio
+from redbot.core import commands
 import aiohttp
 import asyncio
 
@@ -10,29 +10,37 @@ class Radio(commands.Cog):
         self.bot = bot
         self.stations = []
         self.session = aiohttp.ClientSession()
-        self.track_task = self.bot.loop.create_task(self.trackinfo_loop())
         self.track_channel = None
         self.last_title = None
+        self.track_task = self.bot.loop.create_task(self.trackinfo_loop())
 
     def cog_unload(self):
         if self.track_task:
             self.track_task.cancel()
         self.bot.loop.create_task(self.session.close())
 
+    async def get_audio_cog(self):
+        audio_cog = self.bot.get_cog("Audio")
+        if not audio_cog:
+            raise RuntimeError("❌ Audio cog is not loaded.")
+        return audio_cog
+
     async def get_player(self, ctx):
-        vc = ctx.author.voice.channel if ctx.author.voice else None
-        if not vc:
+        audio_cog = await self.get_audio_cog()
+        if not ctx.author.voice or not ctx.author.voice.channel:
             await ctx.send("You must be in a voice channel.")
             return None
-        player = audio.get_player(ctx.guild.id)
+
+        vc = ctx.author.voice.channel
+        player = audio_cog.get_player(ctx.guild.id)
         if not player:
-            player = await audio.connect(self.bot, vc)
+            player = await audio_cog.connect(vc)
         return player
 
     @commands.command()
     async def searchstations(self, ctx, *, query: str):
         """Search radio stations by name or tag."""
-        api = f"https://de2.api.radio-browser.info/json/stations/byname{query}"
+        api = f"https://de1.api.radio-browser.info/json/stations/byname{query}"
         async with self.session.get(api) as resp:
             if resp.status != 200:
                 await ctx.send("Failed to fetch stations.")
@@ -70,8 +78,9 @@ class Radio(commands.Cog):
 
     @commands.command()
     async def stopstation(self, ctx):
-        """Stop the stream."""
-        player = audio.get_player(ctx.guild.id)
+        """Stop the radio stream."""
+        audio_cog = await self.get_audio_cog()
+        player = audio_cog.get_player(ctx.guild.id)
         if player and player.is_playing:
             await player.stop()
             await ctx.send("⏹️ Stream stopped.")
@@ -81,7 +90,8 @@ class Radio(commands.Cog):
     @commands.command()
     async def trackinfo(self, ctx):
         """Show now-playing track metadata."""
-        player = audio.get_player(ctx.guild.id)
+        audio_cog = await self.get_audio_cog()
+        player = audio_cog.get_player(ctx.guild.id)
         if not player or not player.is_playing:
             await ctx.send("Nothing is playing.")
             return
@@ -100,7 +110,10 @@ class Radio(commands.Cog):
             if not self.track_channel:
                 continue
             try:
-                player = audio.get_player(self.track_channel.guild.id)
+                audio_cog = self.bot.get_cog("Audio")
+                if not audio_cog:
+                    continue
+                player = audio_cog.get_player(self.track_channel.guild.id)
                 if player and player.is_playing:
                     current = await player.current()
                     title = getattr(current, "title", None)
