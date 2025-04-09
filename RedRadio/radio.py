@@ -33,7 +33,7 @@ class RedRadio(commands.Cog):
                     print("[DEBUG] No icy-metaint found — no metadata in this stream.")
                     return None
 
-                raw = await resp.content.read(metaint + 1024)
+                raw = await resp.content.read(metaint + 4096)
                 print(f"[DEBUG] Raw length: {len(raw)}, Expected at least: {metaint + 1}")
                 metadata_offset = metaint
 
@@ -114,7 +114,7 @@ class RedRadio(commands.Cog):
 
         embed = discord.Embed(
             title=f"📻 Now Playing: {station['name']}",
-            description=f"🎧 Country: {station['country']}\n🔗 [Stream Link]({stream_url})",
+            description=f"🎷 Country: {station['country']}\n🔗 [Stream Link]({stream_url})",
             color=discord.Color.blurple()
         )
         embed.set_footer(text="Use AS!stopstation to stop playback.")
