@@ -1,11 +1,9 @@
 import discord
-from redbot.core import commands
+from redbot.core import commands, apis
 import aiohttp
 import asyncio
 import re
 import urllib.parse
-
-LASTFM_API_KEY = "067585eb2f42693ad00de3bbd2fda02a"
 
 class RedRadio(commands.Cog):
     """Radio streaming cog with track info and album art."""
@@ -16,12 +14,16 @@ class RedRadio(commands.Cog):
         self.stations = []
         self.track_channel = None
         self.last_title = None
+        self.lastfm_api_key = None
         self.track_task = self.bot.loop.create_task(self.trackinfo_loop())
 
     def cog_unload(self):
         if self.track_task:
             self.track_task.cancel()
         self.bot.loop.create_task(self.session.close())
+
+    async def cog_load(self):
+        self.lastfm_api_key = await apis.get_api_key(self.bot, "radio", "lastfm")
 
     async def get_stream_metadata(self, stream_url):
         headers = {"Icy-MetaData": "1", "User-Agent": "Mozilla/5.0"}
@@ -49,9 +51,11 @@ class RedRadio(commands.Cog):
     async def get_metadata_from_lastfm(self, artist, title):
         if not artist or not title:
             return None
+        if not self.lastfm_api_key:
+            return None
         params = {
             "method": "track.getInfo",
-            "api_key": LASTFM_API_KEY,
+            "api_key": self.lastfm_api_key,
             "artist": artist,
             "track": title,
             "format": "json"
@@ -77,7 +81,7 @@ class RedRadio(commands.Cog):
 
     @commands.command()
     async def searchstations(self, ctx, *, query: str):
-        url = f"https://de2.api.radio-browser.info/json/stations/byname/{query}"
+        url = f"https://de1.api.radio-browser.info/json/stations/byname/{query}"
         async with self.session.get(url) as resp:
             if resp.status != 200:
                 await ctx.send("Failed to fetch stations.")
@@ -147,7 +151,7 @@ class RedRadio(commands.Cog):
     async def trackinfo_loop(self):
         await self.bot.wait_until_ready()
         while self.bot.is_ready():
-            await asyncio.sleep(30)
+            await asyncio.sleep(10)
             if not self.track_channel:
                 continue
             try:
