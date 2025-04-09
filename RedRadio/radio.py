@@ -31,7 +31,15 @@ class RedRadio(commands.Cog):
                     return None
                 raw = await resp.content.read(metaint + 4080)
                 metadata_offset = metaint
+
+                if len(raw) < metadata_offset + 1:
+                    return None  # not enough data to read metadata length
+
                 metadata_length = raw[metadata_offset] * 16
+
+                if len(raw) < metadata_offset + 1 + metadata_length:
+                    return None  # not enough metadata bytes
+
                 metadata_content = raw[metadata_offset + 1:metadata_offset + 1 + metadata_length].decode("utf-8", errors="ignore")
                 match = re.search(r"StreamTitle='(.*?)';", metadata_content)
                 if match:
@@ -70,7 +78,7 @@ class RedRadio(commands.Cog):
     @commands.command()
     async def playstation(self, ctx, index: int):
         if not self.stations:
-            await ctx.send("Please use `!searchstations` first.")
+            await ctx.send("Please use `AS!searchstations` first.")
             return
         if index < 1 or index > len(self.stations):
             await ctx.send("Invalid station number.")
@@ -153,3 +161,4 @@ class RedRadio(commands.Cog):
 
                 except Exception as e:
                     print(f"[Radio TrackInfo Loop] Error in guild {guild.id}: {e}")
+
