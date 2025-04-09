@@ -127,7 +127,7 @@ class RedRadio(commands.Cog):
     async def trackinfo_loop(self):
         await self.bot.wait_until_ready()
         while self.bot.is_ready():
-            await asyncio.sleep(10)  # check every 10 seconds instead of 30
+            await asyncio.sleep(1)  # check every 10 seconds instead of 30
             for guild in self.bot.guilds:
                 try:
                     stream_url = await self.config.guild(guild).stream_url()
