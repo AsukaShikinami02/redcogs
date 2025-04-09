@@ -88,7 +88,7 @@ class RedRadio(commands.Cog):
                 title=f"🔎 Results for '{query}' (Page {page_num + 1}/{total_pages})",
                 color=discord.Color.green()
             )
-            for i, s in enumerate(pages[page_num], start=page_num * 10 + 1):
+        for i, s in enumerate(pages[page_num], start=page_num * 10 + 1):
                 tags = s['tags'][:100] if s['tags'] else 'No tags'
                 if len(tags) > 100:
                     tags = tags[:97] + '...'
@@ -96,7 +96,7 @@ class RedRadio(commands.Cog):
                 field_value = f"Bitrate: {s['bitrate']} kbps\nTags: {tags}"
                 embed.add_field(name=field_name[:256], value=field_value[:1024], inline=False)
             embed.set_footer(text="Use AS!playstation <number> to play.")
-            return embed
+        return embed
 
     
         message = await ctx.send(embed=make_embed(current_page))
