@@ -1,5 +1,4 @@
 import discord
-from redbot.core import commands
 import aiohttp
 import asyncio
 
