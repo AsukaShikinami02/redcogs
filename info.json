@@ -1,17 +1,17 @@
 {
-  "author": [ "Asuka Shikinami" ],
-  "description": "Just a repo I'm making",
-  "disabled": false,
-  "end_user_data_statement":  "this cog does not persistently store data or metadata about users",
-  "hidden": false,
-  "install_msg": "Thanks for installing I hope you enjoy, if you have any questions or suggestions feel free to DM me (asukatism)",
-  "max_bot_version": "0.0.0",
-  "min_bot_version": "3.3.10",
-  "name": "AsuCogs",
-  "permissions": [],
-  "required_cogs": {},
-  "requirements": [],
-  "short": "Some cogs I'm making",
-  "tags": [ "utility", "pluralkit" ],
-  "type": "COG"
-}
+    "author": [ "Asuka Shikinami" ],
+    "description": "a simple radio cog",
+    "disabled": false,
+    "end_user_data_statement":  "this cog does not persistently store data or metadata about users",
+    "hidden": false,
+    "install_msg": "Thanks for installing Radio, I hope it comes in handy :). run [p]load pkcog to load it.",
+    "max_bot_version": "0.0.0",
+    "min_bot_version": "3.3.10",
+    "name": "RedRadio",
+    "permissions": [],
+    "required_cogs": {},
+    "requirements": [],
+    "short": "a simple radio cog for Red",
+    "tags": [ "music" ],
+    "type": "COG"
+  }
