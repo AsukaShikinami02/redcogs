@@ -21,7 +21,7 @@ class RedRadio(commands.Cog):
 
     @commands.command()
     async def searchstations(self, ctx, *, query: str):
-        """Search for radio stations by name or tag."""
+        """Search for radio stations by name"""
         api = f"https://de2.api.radio-browser.info/json/stations/byname/{query}"
         async with self.session.get(api) as resp:
             if resp.status != 200:
