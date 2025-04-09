@@ -83,7 +83,7 @@ class RedRadio(commands.Cog):
         total_pages = len(pages)
         current_page = 0
     
-           def make_embed(page_num):
+        def make_embed(page_num):
            embed = discord.Embed(
                 title=f"🔎 Results for '{query}' (Page {page_num + 1}/{total_pages})",
                 color=discord.Color.green()
