@@ -3,7 +3,7 @@ from redbot.core import commands
 import aiohttp
 import asyncio
 
-class Radio(commands.Cog):
+class RedRadio(commands.Cog):
     """Radio streaming cog using Audio cog and RadioBrowser API"""
 
     def __init__(self, bot):
