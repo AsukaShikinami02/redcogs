@@ -56,7 +56,7 @@ class RedRadio(commands.Cog):
 
     @commands.command()
     async def searchstations(self, ctx, *, query: str):
-        url = f"https://de2.api.radio-browser.info/json/stations/byname/{query}"
+        url = f"https://de2.api.radio-browser.info/json/stations/byname/{query}5"
         async with self.session.get(url) as resp:
             if resp.status != 200:
                 await ctx.send("Failed to fetch stations.")
@@ -129,7 +129,7 @@ class RedRadio(commands.Cog):
         await self.bot.wait_until_ready()
         while self.bot.is_ready():
             print(f"[{datetime.datetime.now()}] Sleeping for 10 seconds...")
-            await asyncio.sleep(10)  # check every 10 seconds
+            await asyncio.sleep(10)
             print(f"[{datetime.datetime.now()}] Checking metadata...")
             for guild in self.bot.guilds:
                 try:
@@ -143,16 +143,19 @@ class RedRadio(commands.Cog):
                         continue
 
                     metadata = await self.get_stream_metadata(stream_url)
+                    print(f"[{guild.name}] Got metadata: {metadata}")
                     if not metadata:
                         continue
 
                     artist = metadata.get("artist")
                     title = metadata.get("title")
+                    print(f"[{guild.name}] Last title: {self.last_title.get(guild.id)}")
 
                     if not title or self.last_title.get(guild.id) == title:
                         continue
 
                     self.last_title[guild.id] = title
+                    print(f"[{guild.name}] Sending update to #{channel.name}")
 
                     embed = discord.Embed(
                         title="🎶 Now Playing",
