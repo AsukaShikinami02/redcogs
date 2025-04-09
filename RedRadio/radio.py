@@ -14,7 +14,7 @@ class RedRadio(commands.Cog):
         self.config = Config.get_conf(self, identifier=90210, force_registration=True)
         self.config.register_guild(stream_url=None, track_channel=None)
         self.stations = []
-        self.last_title = {}
+        self.last_title = {}  # Store last titles per guild
         self.track_task = self.bot.loop.create_task(self.trackinfo_loop())
 
     def cog_unload(self):
@@ -55,7 +55,7 @@ class RedRadio(commands.Cog):
 
     @commands.command()
     async def searchstations(self, ctx, *, query: str):
-        url = f"https://de2.api.radio-browser.info/json/stations/byname/{query}"
+        url = f"https://de1.api.radio-browser.info/json/stations/byname/{query}"
         async with self.session.get(url) as resp:
             if resp.status != 200:
                 await ctx.send("Failed to fetch stations.")
@@ -100,7 +100,7 @@ class RedRadio(commands.Cog):
 
         await self.config.guild(ctx.guild).track_channel.set(ctx.channel.id)
         await self.config.guild(ctx.guild).stream_url.set(stream_url)
-        self.last_title = None
+        self.last_title[ctx.guild.id] = None
 
         embed = discord.Embed(
             title=f"📻 Now Playing: {station['name']}",
@@ -127,7 +127,7 @@ class RedRadio(commands.Cog):
     async def trackinfo_loop(self):
         await self.bot.wait_until_ready()
         while self.bot.is_ready():
-            await asyncio.sleep(10)
+            await asyncio.sleep(10)  # check every 10 seconds instead of 30
             for guild in self.bot.guilds:
                 try:
                     stream_url = await self.config.guild(guild).stream_url()
@@ -148,9 +148,8 @@ class RedRadio(commands.Cog):
 
                     if not title or self.last_title.get(guild.id) == title:
                         continue
-                    
+
                     self.last_title[guild.id] = title
-                    
 
                     embed = discord.Embed(
                         title="🎶 Now Playing",
@@ -162,4 +161,3 @@ class RedRadio(commands.Cog):
 
                 except Exception as e:
                     print(f"[Radio TrackInfo Loop] Error in guild {guild.id}: {e}")
-
