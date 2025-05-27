@@ -1,0 +1,10 @@
+{
+  "author": ["Asuka Shikinami"],
+  "name": "DealOrNoDeal",
+  "description": "A full-featured Deal or No Deal game with Redbot economy integration.",
+  "install_msg": "Thanks for installing DealOrNoDeal! Use `[p]deal start` to begin playing.",
+  "requirements": [],
+  "permissions": [],
+  "end_user_data_statement": "Stores user game data in JSON format to track game progress.",
+  "min_bot_version": "3.5.0"
+}
