@@ -1,4 +1,4 @@
-from .radio import RedRadio
+from .deal import DealOrNoDeal
 
 async def setup(bot):
-    await bot.add_cog(RedRadio(bot))
+    await bot.add_cog(DealOrNoDeal(bot))
