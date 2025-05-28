@@ -86,7 +86,7 @@ class DealOrNoDeal(commands.Cog):
         self.games[user_id] = self.create_new_game()
         self.save()
         await ctx.send(f"$500 deducted. 🎲 Pick your case to keep:",
-                       view=self.make_case_view(ctx.author))
+                       view=self.make_case_view(ctx.author, page=0))
 
     @deal.command()
     async def forfeit(self, ctx):
@@ -98,12 +98,23 @@ class DealOrNoDeal(commands.Cog):
         else:
             await ctx.send("You have no active game.")
 
-    def make_case_view(self, user):
+    def make_case_view(self, user, page=0):
         game = self.games[str(user.id)]
         view = View()
-        for i in range(1, 27):
-            if i not in game["opened_cases"]:
-                view.add_item(self.CaseButton(i, self, user))
+        case_numbers = [i for i in range(1, 27) if i not in game["opened_cases"]]
+        max_per_page = 25
+        paginated = case_numbers[page*max_per_page:(page+1)*max_per_page]
+
+        for i in paginated:
+            view.add_item(self.CaseButton(i, self, user))
+
+        # Add pagination if needed
+        if len(case_numbers) > max_per_page:
+            if page > 0:
+                view.add_item(self.PrevPageButton(user, self, page - 1))
+            if (page + 1) * max_per_page < len(case_numbers):
+                view.add_item(self.NextPageButton(user, self, page + 1))
+
         return view
 
     class CaseButton(Button):
@@ -179,3 +190,23 @@ class DealOrNoDeal(commands.Cog):
             self.cog.save()
             await interaction.response.send_message("📦 No Deal! Pick more cases:",
                                                     view=self.cog.make_case_view(self.user))
+
+    class PrevPageButton(Button):
+        def __init__(self, user, cog, page):
+            super().__init__(label="Previous", style=discord.ButtonStyle.secondary)
+            self.user = user
+            self.cog = cog
+            self.page = page
+
+        async def callback(self, interaction):
+            await interaction.response.edit_message(view=self.cog.make_case_view(self.user, self.page))
+
+    class NextPageButton(Button):
+        def __init__(self, user, cog, page):
+            super().__init__(label="Next", style=discord.ButtonStyle.secondary)
+            self.user = user
+            self.cog = cog
+            self.page = page
+
+        async def callback(self, interaction):
+            await interaction.response.edit_message(view=self.cog.make_case_view(self.user, self.page))
