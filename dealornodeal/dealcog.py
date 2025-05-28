@@ -64,7 +64,7 @@ class DealOrNoDeal(commands.Cog):
     @commands.group(invoke_without_command=True)
     async def deal(self, ctx):
         """Play Deal or No Deal"""
-        await ctx.send("Use a subcommand: start, pick, open, deal, nodeal, or forfeit.")
+        await ctx.send("Use a subcommand: start, pick, open, accept, nodeal, or forfeit.")
 
     @deal.command()
     async def start(self, ctx):
@@ -135,13 +135,13 @@ class DealOrNoDeal(commands.Cog):
             offer = self.banker_offer(game)
             game["offers"].append(offer)
             self.save()
-            await ctx.send(f"☎️ The Banker offers: **${offer:,}**. Type `[p]deal deal` to accept or `[p]deal nodeal` to continue.")
+            await ctx.send(f"☎️ The Banker offers: **${offer:,}**. Type `[p]deal accept` to accept or `[p]deal nodeal` to continue.")
         else:
             self.save()
             await ctx.send(embed=self.build_case_embed(user_id))
 
-    @deal.command()
-    async def deal(self, ctx):
+    @deal.command(name="accept")
+    async def deal_accept(self, ctx):
         user_id = str(ctx.author.id)
         if user_id not in self.games:
             await ctx.send("You don't have an active game.")
@@ -168,7 +168,7 @@ class DealOrNoDeal(commands.Cog):
         game = self.games[user_id]
         game["round"] += 1
         self.save()
-        await ctx.send("📦 No Deal! Continue opening cases with `!deal open <case_number>`.")
+        await ctx.send("📦 No Deal! Continue opening cases with `[p]deal open <case_number>`.")
 
     @deal.command()
     async def forfeit(self, ctx):
