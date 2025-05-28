@@ -82,13 +82,13 @@ class DealOrNoDeal(commands.Cog):
         await bank.withdraw_credits(ctx.author, COST_TO_PLAY)
         self.games[user_id] = self.create_new_game()
         self.save()
-        await ctx.send(f"${COST_TO_PLAY} deducted. 🎲 Please pick your case to keep with `[p]deal pick <case_number>` (1-26).")
+        await ctx.send(f"${COST_TO_PLAY} deducted. 🎲 Please pick your case to keep with `deal pick <case_number>` (1-26).")
 
     @deal.command()
     async def pick(self, ctx, case: int):
         user_id = str(ctx.author.id)
         if user_id not in self.games:
-            await ctx.send("You don't have an active game. Start one with `[p]deal start`.")
+            await ctx.send("You don't have an active game. Start one with `deal start`.")
             return
 
         game = self.games[user_id]
@@ -98,7 +98,7 @@ class DealOrNoDeal(commands.Cog):
                 return
             game["player_case"] = case
             self.save()
-            await ctx.send(f"🎉 You chose case #{case} to keep. Now open 6 other cases with `[p]deal open <case_number>`.")
+            await ctx.send(f"🎉 You chose case #{case} to keep. Now open 6 other cases with `deal open <case_number>`.")
         else:
             await ctx.send("You've already picked your case.")
 
@@ -115,7 +115,7 @@ class DealOrNoDeal(commands.Cog):
             return
 
         if game["player_case"] is None:
-            await ctx.send("Pick your case first using `[p]deal pick <number>`.")
+            await ctx.send("Pick your case first using `deal pick <number>`.")
             return
 
         if case == game["player_case"] or case in game["opened_cases"]:
@@ -135,7 +135,7 @@ class DealOrNoDeal(commands.Cog):
             offer = self.banker_offer(game)
             game["offers"].append(offer)
             self.save()
-            await ctx.send(f"☎️ The Banker offers: **${offer:,}**. Type `[p]deal accept` to accept or `[p]deal nodeal` to continue.")
+            await ctx.send(f"☎️ The Banker offers: **${offer:,}**. Type `deal accept` to accept or `deal nodeal` to continue.")
         else:
             self.save()
             await ctx.send(embed=self.build_case_embed(user_id))
@@ -168,7 +168,7 @@ class DealOrNoDeal(commands.Cog):
         game = self.games[user_id]
         game["round"] += 1
         self.save()
-        await ctx.send("📦 No Deal! Continue opening cases with `[p]deal open <case_number>`.")
+        await ctx.send("📦 No Deal! Continue opening cases with `deal open <case_number>`.")
 
     @deal.command()
     async def forfeit(self, ctx):
