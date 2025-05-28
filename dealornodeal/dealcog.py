@@ -1,7 +1,6 @@
 import discord
 from redbot.core import commands, Config, bank
 import random, json, os
-from discord.ui import View, Button
 
 COST_TO_PLAY = 500
 CASE_AMOUNTS = [
@@ -34,9 +33,7 @@ class DealOrNoDeal(commands.Cog):
             "opened_cases": [],
             "round": 1,
             "offers": [],
-            "final_phase": False,
             "deal_taken": False,
-            "final_case": None
         }
 
     def get_remaining_values(self, game):
@@ -60,7 +57,7 @@ class DealOrNoDeal(commands.Cog):
                 desc += f"\u274c Case {i}: ${val:,}\n"
             else:
                 desc += f"\U0001f512 Case {i}\n"
-        embed = discord.Embed(title="📦 Deal or No Deal", description=desc, color=0x00ffcc)
+        embed = discord.Embed(title="\ud83d\udce6 Deal or No Deal", description=desc, color=0x00ffcc)
         embed.set_footer(text=f"Round {game['round']}")
         return embed
 
@@ -85,8 +82,89 @@ class DealOrNoDeal(commands.Cog):
         await bank.withdraw_credits(ctx.author, COST_TO_PLAY)
         self.games[user_id] = self.create_new_game()
         self.save()
-        await ctx.send(f"$500 deducted. 🎲 Pick your case to keep:",
-                       view=self.make_case_view(ctx.author, page=0))
+        await ctx.send("$500 deducted. 🎲 Please use the next command to pick your case: `[p]deal pick <case_number>`")
+
+    @deal.command()
+    async def pick(self, ctx, case: int):
+        user_id = str(ctx.author.id)
+        if user_id not in self.games:
+            await ctx.send("You don't have an active game. Start one with `!deal start`.")
+            return
+
+        game = self.games[user_id]
+        if game["player_case"] is None:
+            if case < 1 or case > 26:
+                await ctx.send("Pick a valid case number between 1 and 26.")
+                return
+            game["player_case"] = case
+            self.save()
+            await ctx.send(f"🎉 You chose case #{case} to keep. Open 6 other cases with `[p]deal open <case_number>`.")
+        else:
+            await ctx.send("You've already picked your case.")
+
+    @deal.command()
+    async def open(self, ctx, case: int):
+        user_id = str(ctx.author.id)
+        if user_id not in self.games:
+            await ctx.send("You don't have an active game.")
+            return
+
+        game = self.games[user_id]
+        if game["deal_taken"]:
+            await ctx.send("The game has already ended.")
+            return
+
+        if game["player_case"] is None:
+            await ctx.send("Pick your case first using `!deal pick <number>`.")
+            return
+
+        if case == game["player_case"] or case in game["opened_cases"]:
+            await ctx.send("You can't open this case.")
+            return
+
+        game["opened_cases"].append(case)
+        val = game["case_values"][case - 1]
+        await ctx.send(f"💼 Case #{case} had **${val:,}**")
+
+        cases_to_open = 6 - game["round"] + 1
+        if len(game["opened_cases"]) >= cases_to_open:
+            offer = self.banker_offer(game)
+            game["offers"].append(offer)
+            self.save()
+            await ctx.send(f"☎️ The Banker offers: **${offer:,}**. Type `[p]deal deal` to accept or `[p]deal nodeal` to continue.")
+        else:
+            self.save()
+            await ctx.send(embed=self.build_case_embed(user_id))
+
+    @deal.command()
+    async def deal(self, ctx):
+        user_id = str(ctx.author.id)
+        if user_id not in self.games:
+            await ctx.send("You don't have an active game.")
+            return
+
+        game = self.games[user_id]
+        if not game["offers"]:
+            await ctx.send("There is no offer yet.")
+            return
+
+        offer = game["offers"][-1]
+        await bank.deposit_credits(ctx.author, offer)
+        game["deal_taken"] = True
+        self.save()
+        await ctx.send(f"✅ You accepted the deal and won **${offer:,}**!")
+
+    @deal.command()
+    async def nodeal(self, ctx):
+        user_id = str(ctx.author.id)
+        if user_id not in self.games:
+            await ctx.send("You don't have an active game.")
+            return
+
+        game = self.games[user_id]
+        game["round"] += 1
+        self.save()
+        await ctx.send("📦 No Deal! Continue opening cases with `[p]deal open <case_number>`.")
 
     @deal.command()
     async def forfeit(self, ctx):
@@ -97,116 +175,3 @@ class DealOrNoDeal(commands.Cog):
             await ctx.send("Your game was cancelled.")
         else:
             await ctx.send("You have no active game.")
-
-    def make_case_view(self, user, page=0):
-        game = self.games[str(user.id)]
-        view = View()
-        case_numbers = [i for i in range(1, 27) if i not in game["opened_cases"]]
-        max_per_page = 25
-        paginated = case_numbers[page*max_per_page:(page+1)*max_per_page]
-
-        for i in paginated:
-            view.add_item(self.CaseButton(i, self, user))
-
-        # Add pagination if needed
-        if len(case_numbers) > max_per_page:
-            if page > 0:
-                view.add_item(self.PrevPageButton(user, self, page - 1))
-            if (page + 1) * max_per_page < len(case_numbers):
-                view.add_item(self.NextPageButton(user, self, page + 1))
-
-        return view
-
-    class CaseButton(Button):
-        def __init__(self, case_number, cog, user):
-            super().__init__(label=f"Case {case_number}", style=discord.ButtonStyle.primary)
-            self.case_number = case_number
-            self.cog = cog
-            self.user = user
-
-        async def callback(self, interaction):
-            user_id = str(self.user.id)
-            game = self.cog.games[user_id]
-
-            if game["deal_taken"]:
-                await interaction.response.send_message("The game has already ended.", ephemeral=True)
-                return
-
-            if game["player_case"] is None:
-                game["player_case"] = self.case_number
-                self.cog.save()
-                await interaction.response.send_message(
-                    f"🎉 You chose case #{self.case_number} to keep. Open 6 other cases.",
-                    ephemeral=True
-                )
-            else:
-                if self.case_number == game["player_case"] or self.case_number in game["opened_cases"]:
-                    await interaction.response.send_message("You can't open this case.", ephemeral=True)
-                    return
-
-                game["opened_cases"].append(self.case_number)
-                val = game["case_values"][self.case_number - 1]
-                await interaction.response.send_message(f"💼 Case #{self.case_number} had **${val:,}**")
-
-                cases_to_open = 6 - game["round"] + 1
-                if len(game["opened_cases"]) >= cases_to_open:
-                    offer = self.cog.banker_offer(game)
-                    game["offers"].append(offer)
-                    self.cog.save()
-                    view = View()
-                    view.add_item(self.cog.DealButton(self.user, offer, self.cog))
-                    view.add_item(self.cog.NoDealButton(self.user, self.cog))
-                    await interaction.followup.send(f"☎️ The Banker offers: **${offer:,}**\nDeal or No Deal?", view=view)
-                else:
-                    self.cog.save()
-                    await interaction.followup.send(embed=self.cog.build_case_embed(user_id),
-                                                   view=self.cog.make_case_view(self.user))
-
-    class DealButton(Button):
-        def __init__(self, user, offer, cog):
-            super().__init__(label="Deal", style=discord.ButtonStyle.success)
-            self.user = user
-            self.offer = offer
-            self.cog = cog
-
-        async def callback(self, interaction):
-            await bank.deposit_credits(self.user, self.offer)
-            user_id = str(self.user.id)
-            game = self.cog.games[user_id]
-            game["deal_taken"] = True
-            self.cog.save()
-            await interaction.response.send_message(f"✅ You accepted the deal and won **${self.offer:,}**!")
-
-    class NoDealButton(Button):
-        def __init__(self, user, cog):
-            super().__init__(label="No Deal", style=discord.ButtonStyle.danger)
-            self.user = user
-            self.cog = cog
-
-        async def callback(self, interaction):
-            user_id = str(self.user.id)
-            game = self.cog.games[user_id]
-            game["round"] += 1
-            self.cog.save()
-            await interaction.response.send_message("📦 No Deal! Pick more cases:",
-                                                    view=self.cog.make_case_view(self.user))
-
-    class PrevPageButton(Button):
-        def __init__(self, user, cog, page):
-            super().__init__(label="Previous", style=discord.ButtonStyle.secondary)
-            self.user = user
-            self.cog = cog
-            self.page = page
-
-        async def callback(self, interaction):
-            await interaction.response.edit_message(view=self.cog.make_case_view(self.user, self.page))
-
-    class NextPageButton(Button):
-        def __init__(self, user, cog, page):
-            super().__init__(label="Next", style=discord.ButtonStyle.secondary)
-            self.user = user
-            self.cog = cog
-            self.page = page
-
-        async def callback(self, interaction):
-            await interaction.response.edit_message(view=self.cog.make_case_view(self.user, self.page))
