@@ -1,5 +1,5 @@
 import discord
-from redbot.core import commands, Config, bank
+from redbot.core import commands, bank
 import random, json, os
 
 COST_TO_PLAY = 500
@@ -57,14 +57,14 @@ class DealOrNoDeal(commands.Cog):
                 desc += f"\u274c Case {i}: ${val:,}\n"
             else:
                 desc += f"\U0001f512 Case {i}\n"
-        embed = discord.Embed(title="\ud83d\udce6 Deal or No Deal", description=desc, color=0x00ffcc)
+        embed = discord.Embed(title="📦 Deal or No Deal", description=desc, color=0x00ffcc)
         embed.set_footer(text=f"Round {game['round']}")
         return embed
 
-    @commands.group()
+    @commands.group(invoke_without_command=True)
     async def deal(self, ctx):
         """Play Deal or No Deal"""
-        pass
+        await ctx.send("Use a subcommand: start, pick, open, deal, nodeal, or forfeit.")
 
     @deal.command()
     async def start(self, ctx):
@@ -82,13 +82,13 @@ class DealOrNoDeal(commands.Cog):
         await bank.withdraw_credits(ctx.author, COST_TO_PLAY)
         self.games[user_id] = self.create_new_game()
         self.save()
-        await ctx.send("$500 deducted. 🎲 Please use the next command to pick your case: `[p]deal pick <case_number>`")
+        await ctx.send(f"${COST_TO_PLAY} deducted. 🎲 Please pick your case to keep with `[p]deal pick <case_number>` (1-26).")
 
     @deal.command()
     async def pick(self, ctx, case: int):
         user_id = str(ctx.author.id)
         if user_id not in self.games:
-            await ctx.send("You don't have an active game. Start one with `!deal start`.")
+            await ctx.send("You don't have an active game. Start one with `[p]deal start`.")
             return
 
         game = self.games[user_id]
@@ -98,7 +98,7 @@ class DealOrNoDeal(commands.Cog):
                 return
             game["player_case"] = case
             self.save()
-            await ctx.send(f"🎉 You chose case #{case} to keep. Open 6 other cases with `[p]deal open <case_number>`.")
+            await ctx.send(f"🎉 You chose case #{case} to keep. Now open 6 other cases with `[p]deal open <case_number>`.")
         else:
             await ctx.send("You've already picked your case.")
 
@@ -115,11 +115,15 @@ class DealOrNoDeal(commands.Cog):
             return
 
         if game["player_case"] is None:
-            await ctx.send("Pick your case first using `!deal pick <number>`.")
+            await ctx.send("Pick your case first using `[p]deal pick <number>`.")
             return
 
         if case == game["player_case"] or case in game["opened_cases"]:
             await ctx.send("You can't open this case.")
+            return
+
+        if case < 1 or case > 26:
+            await ctx.send("Pick a valid case number between 1 and 26.")
             return
 
         game["opened_cases"].append(case)
@@ -164,7 +168,7 @@ class DealOrNoDeal(commands.Cog):
         game = self.games[user_id]
         game["round"] += 1
         self.save()
-        await ctx.send("📦 No Deal! Continue opening cases with `[p]deal open <case_number>`.")
+        await ctx.send("📦 No Deal! Continue opening cases with `!deal open <case_number>`.")
 
     @deal.command()
     async def forfeit(self, ctx):
