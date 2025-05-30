@@ -135,6 +135,18 @@ class DealOrNoDeal(commands.Cog):
         val = game["case_values"][case - 1]
         await ctx.send(f"💼 Case #{case} had **${val:,}**")
 
+        remaining = 26 - len(game["opened_cases"])
+        if remaining == 1:
+            player_val = game["case_values"][game["player_case"] - 1]
+            await ctx.send(
+                f"🎉 All other cases have been opened!\n"
+                f"Your case #{game['player_case']} contained **${player_val:,}**!\n"
+                f"Thanks for playing Deal or No Deal!"
+            )
+            del self.games[user_id]
+            self.save()
+            return
+
         cases_to_open = 6 - game["round"] + 1
         if len(game["opened_cases"]) >= cases_to_open:
             offer = self.banker_offer(game)
@@ -166,9 +178,10 @@ class DealOrNoDeal(commands.Cog):
             await ctx.send(f"Error depositing winnings: {e}")
             return
 
-        game["deal_taken"] = True
-        self.save()
         await ctx.send(f"✅ You accepted the deal and won **${payout:,}**!")
+
+        del self.games[user_id]
+        self.save()
 
     @deal.command()
     async def nodeal(self, ctx):
