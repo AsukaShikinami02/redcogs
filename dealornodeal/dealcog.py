@@ -117,39 +117,39 @@ class DealOrNoDeal(commands.Cog):
         bar = "🟩" * filled + "⬜" * (20 - filled)
         return f"Round {game['round']} Progress: {bar} {int(progress*100)}%"
 
-    def build_case_embed(self, user_id):
-        game = self.games[str(user_id)]
-        embed = discord.Embed(title="📦 Deal or No Deal", color=0x00ffcc)
-        
-        # Create a grid of cases (4 rows of 6-7 cases each)
-        grid = []
-        for i in range(1, 27):
-            if i == game["player_case"]:
-                grid.append(f"🔒 **{i}**")
-            elif i in game["opened_cases"]:
-                val = game["case_values"][i - 1]
-                grid.append(f"❌ ~~{i}~~")
-            else:
-                grid.append(f"📦 {i}")
-        
-        # Split into rows
-        for row in [grid[i:i+7] for i in range(0, 26, 7)]:
-            embed.add_field(name="\u200b", value=" ".join(row), inline=False)
-        
-        # Show remaining values
-        remaining = self.get_remaining_values(game)
-        if remaining:
-            embed.add_field(name="Remaining Values", value=", ".join(f"${x:,}" for x in sorted(remaining)), inline=False)
-        
-        # Show progress bar
-        embed.add_field(name="Progress", value=self.build_progress_bar(game), inline=False)
-        
-        # Show current round and offers
-        if game["offers"]:
-            embed.set_footer(text=f"Round {game['round']} • Last offer: ${game['offers'][-1]:,}")
+  def build_case_embed(self, user_id):
+    game = self.games[str(user_id)]  # Fixed this line - removed extra bracket
+    embed = discord.Embed(title="📦 Deal or No Deal", color=0x00ffcc)
+    
+    # Create a grid of cases (4 rows of 6-7 cases each)
+    grid = []
+    for i in range(1, 27):
+        if i == game["player_case"]:
+            grid.append(f"🔒 **{i}**")
+        elif i in game["opened_cases"]:
+            val = game["case_values"][i - 1]
+            grid.append(f"❌ ~~{i}~~")
         else:
-            embed.set_footer(text=f"Round {game['round']}")
-        return embed
+            grid.append(f"📦 {i}")
+    
+    # Split into rows
+    for row in [grid[i:i+7] for i in range(0, 26, 7)]:
+        embed.add_field(name="\u200b", value=" ".join(row), inline=False)
+    
+    # Show remaining values
+    remaining = self.get_remaining_values(game)
+    if remaining:
+        embed.add_field(name="Remaining Values", value=", ".join(f"${x:,}" for x in sorted(remaining)), inline=False)
+    
+    # Show progress bar
+    embed.add_field(name="Progress", value=self.build_progress_bar(game), inline=False)
+    
+    # Show current round and offers
+    if game["offers"]:
+        embed.set_footer(text=f"Round {game['round']} • Last offer: ${game['offers'][-1]:,}")
+    else:
+        embed.set_footer(text=f"Round {game['round']}")
+    return embed
 
     @commands.group(invoke_without_command=True)
     async def deal(self, ctx):
