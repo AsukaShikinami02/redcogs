@@ -11,6 +11,8 @@ CASE_AMOUNTS = [
     400000, 500000, 750000, 1000000
 ]
 
+ROUND_STRUCTURE = [6, 5, 4, 3, 2] + [1] * 15  # Opening pattern per round
+
 class DealOrNoDeal(commands.Cog):
     def __init__(self, bot):
         self.bot = bot
@@ -34,29 +36,32 @@ class DealOrNoDeal(commands.Cog):
             "round": 1,
             "offers": [],
             "deal_taken": False,
+            "final_swap": False,
+            "final_stage": False
         }
 
     def get_remaining_values(self, game):
         return [v for i, v in enumerate(game["case_values"])
-                if i + 1 not in game["opened_cases"] and (i + 1) != game["player_case"]]
+                if (i + 1) not in game["opened_cases"] and (i + 1) != game["player_case"]]
 
     def banker_offer(self, game):
         values = self.get_remaining_values(game)
         average = sum(values) / len(values)
-        multiplier = 0.6 + (game["round"] * 0.05)
-        return round(average * multiplier, 2)
+        multiplier = 0.5 + (game["round"] * 0.05)
+        random_factor = random.uniform(0.9, 1.1)
+        return round(average * multiplier * random_factor, 2)
 
     def build_case_embed(self, user_id):
         game = self.games[str(user_id)]
         desc = ""
         for i in range(1, 27):
             if i == game["player_case"]:
-                desc += f"\U0001f4bc **[{i}]** (Your case)\n"
+                desc += f"💼 **[{i}]** (Your case)\n"
             elif i in game["opened_cases"]:
                 val = game["case_values"][i - 1]
-                desc += f"\u274c Case {i}: ${val:,}\n"
+                desc += f"❌ Case {i}: ${val:,}\n"
             else:
-                desc += f"\U0001f512 Case {i}\n"
+                desc += f"🧳 Case {i}\n"
         embed = discord.Embed(title="📦 Deal or No Deal", description=desc, color=0x00ffcc)
         embed.set_footer(text=f"Round {game['round']}")
         return embed
@@ -64,7 +69,7 @@ class DealOrNoDeal(commands.Cog):
     @commands.group(invoke_without_command=True)
     async def deal(self, ctx):
         """Play Deal or No Deal"""
-        await ctx.send("Use a subcommand: start, pick, open, accept, nodeal, or forfeit.")
+        await ctx.send("Use a subcommand: start, pick, open, accept, nodeal, forfeit, or swap.")
 
     @deal.command()
     async def start(self, ctx):
@@ -103,7 +108,7 @@ class DealOrNoDeal(commands.Cog):
                 return
             game["player_case"] = case
             self.save()
-            await ctx.send(f"🎉 You chose case #{case} to keep. Now open 6 other cases with `!deal open <case_number>`.")
+            await ctx.send(f"🎉 You chose case #{case} to keep. Now open cases with `!deal open <case_number>`.")
         else:
             await ctx.send("You've already picked your case.")
 
@@ -135,20 +140,16 @@ class DealOrNoDeal(commands.Cog):
         val = game["case_values"][case - 1]
         await ctx.send(f"💼 Case #{case} had **${val:,}**")
 
-        remaining = 26 - len(game["opened_cases"])
-        if remaining == 1:
-            player_val = game["case_values"][game["player_case"] - 1]
-            await ctx.send(
-                f"🎉 All other cases have been opened!\n"
-                f"Your case #{game['player_case']} contained **${player_val:,}**!\n"
-                f"Thanks for playing Deal or No Deal!"
-            )
-            del self.games[user_id]
+        remaining_unopened = 26 - len(game["opened_cases"]) - 1  # Exclude player's case
+
+        if remaining_unopened == 1:
+            game["final_stage"] = True
             self.save()
+            await ctx.send("🕵️ Only your case and one other remain. Do you want to `!deal swap` your case or keep it?")
             return
 
-        cases_to_open = 6 - game["round"] + 1
-        if len(game["opened_cases"]) >= cases_to_open:
+        opens_required = ROUND_STRUCTURE[game["round"] - 1]
+        if len(game["opened_cases"]) >= sum(ROUND_STRUCTURE[:game["round"]]):
             offer = self.banker_offer(game)
             game["offers"].append(offer)
             self.save()
@@ -178,10 +179,10 @@ class DealOrNoDeal(commands.Cog):
             await ctx.send(f"Error depositing winnings: {e}")
             return
 
-        await ctx.send(f"✅ You accepted the deal and won **${payout:,}**!")
-
-        del self.games[user_id]
+        game["deal_taken"] = True
+        self.games.pop(user_id)
         self.save()
+        await ctx.send(f"✅ You accepted the deal and won **${payout:,}**! Game over.")
 
     @deal.command()
     async def nodeal(self, ctx):
@@ -194,6 +195,39 @@ class DealOrNoDeal(commands.Cog):
         game["round"] += 1
         self.save()
         await ctx.send("📦 No Deal! Continue opening cases with `!deal open <case_number>`.")
+
+    @deal.command()
+    async def swap(self, ctx):
+        user_id = str(ctx.author.id)
+        if user_id not in self.games:
+            await ctx.send("You don't have an active game.")
+            return
+
+        game = self.games[user_id]
+        if not game.get("final_stage"):
+            await ctx.send("You can only swap at the end of the game when 2 cases remain.")
+            return
+
+        remaining = [i for i in range(1, 27) if i != game["player_case"] and i not in game["opened_cases"]]
+        if not remaining:
+            await ctx.send("No case left to swap with.")
+            return
+
+        new_case = remaining[0]
+        original_value = game["case_values"][game["player_case"] - 1]
+        swapped_value = game["case_values"][new_case - 1]
+
+        payout = int(swapped_value)
+        try:
+            await bank.deposit_credits(ctx.author, payout)
+        except Exception as e:
+            await ctx.send(f"Error depositing winnings: {e}")
+            return
+
+        self.games.pop(user_id)
+        self.save()
+        await ctx.send(f"🔄 You swapped your case #{game['player_case']} with case #{new_case}.")
+        await ctx.send(f"🎉 Your new case contained **${swapped_value:,}**! (Your original case had ${original_value:,})")
 
     @deal.command()
     async def forfeit(self, ctx):
