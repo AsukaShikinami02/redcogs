@@ -24,7 +24,7 @@ class DealButtons(View):
         self.user_id = user_id
     
     @discord.ui.button(label="Accept Deal", style=discord.ButtonStyle.green, emoji="✅")
-    async def accept(self, button: Button, interaction: discord.Interaction):
+    async def accept(self, interaction: discord.Interaction, button: Button):
         if str(interaction.user.id) != self.user_id:
             await interaction.response.send_message("This isn't your game!", ephemeral=True)
             return
@@ -52,7 +52,7 @@ class DealButtons(View):
         await interaction.response.edit_message(embed=embed, view=None)
     
     @discord.ui.button(label="No Deal", style=discord.ButtonStyle.red, emoji="❌")
-    async def no_deal(self, button: Button, interaction: discord.Interaction):
+    async def no_deal(self, interaction: discord.Interaction, button: Button):
         if str(interaction.user.id) != self.user_id:
             await interaction.response.send_message("This isn't your game!", ephemeral=True)
             return
