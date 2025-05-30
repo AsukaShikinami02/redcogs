@@ -1,6 +1,10 @@
 import discord
+from discord.ui import Button, View
 from redbot.core import commands, bank
-import random, json, os
+import random
+import json
+import os
+import asyncio
 
 COST_TO_PLAY = 500
 CASE_AMOUNTS = [
@@ -12,6 +16,59 @@ CASE_AMOUNTS = [
 ]
 
 ROUND_STRUCTURE = [6, 5, 4, 3, 2] + [1] * 15  # Opening pattern per round
+
+class DealButtons(View):
+    def __init__(self, cog, user_id):
+        super().__init__(timeout=60)
+        self.cog = cog
+        self.user_id = user_id
+    
+    @discord.ui.button(label="Accept Deal", style=discord.ButtonStyle.green, emoji="✅")
+    async def accept(self, button: Button, interaction: discord.Interaction):
+        if str(interaction.user.id) != self.user_id:
+            await interaction.response.send_message("This isn't your game!", ephemeral=True)
+            return
+        
+        game = self.cog.games[self.user_id]
+        offer = game["offers"][-1]
+        payout = int(offer)
+        
+        try:
+            await bank.deposit_credits(interaction.user, payout)
+        except Exception as e:
+            await interaction.response.send_message(f"Error depositing winnings: {e}")
+            return
+
+        game["deal_taken"] = True
+        self.cog.games.pop(self.user_id)
+        self.cog.save()
+        
+        embed = discord.Embed(
+            title="💼 Deal Accepted!",
+            description=f"**You've accepted the banker's offer of ${offer:,}!**",
+            color=0x00ff00
+        )
+        embed.add_field(name="💰 Winnings", value=f"${payout:,} has been deposited to your account!")
+        await interaction.response.edit_message(embed=embed, view=None)
+    
+    @discord.ui.button(label="No Deal", style=discord.ButtonStyle.red, emoji="❌")
+    async def no_deal(self, button: Button, interaction: discord.Interaction):
+        if str(interaction.user.id) != self.user_id:
+            await interaction.response.send_message("This isn't your game!", ephemeral=True)
+            return
+        
+        game = self.cog.games[self.user_id]
+        game["round"] += 1
+        self.cog.save()
+        
+        embed = discord.Embed(
+            title="📦 No Deal!",
+            description="The game continues!",
+            color=0xff9900
+        )
+        embed.set_footer(text=f"Round {game['round']}")
+        await interaction.response.edit_message(embed=embed, view=None)
+        await interaction.followup.send(embed=self.cog.build_case_embed(self.user_id))
 
 class DealOrNoDeal(commands.Cog):
     def __init__(self, bot):
@@ -51,19 +108,47 @@ class DealOrNoDeal(commands.Cog):
         random_factor = random.uniform(0.9, 1.1)
         return round(average * multiplier * random_factor, 2)
 
+    def build_progress_bar(self, game):
+        total_cases = sum(ROUND_STRUCTURE[:game["round"]])
+        opened_this_round = len(game["opened_cases"]) - sum(ROUND_STRUCTURE[:game["round"]-1]])
+        
+        progress = min(opened_this_round / ROUND_STRUCTURE[game["round"]-1], 1)
+        filled = int(20 * progress)
+        bar = "🟩" * filled + "⬜" * (20 - filled)
+        return f"Round {game['round']} Progress: {bar} {int(progress*100)}%"
+
     def build_case_embed(self, user_id):
         game = self.games[str(user_id)]
-        desc = ""
+        embed = discord.Embed(title="📦 Deal or No Deal", color=0x00ffcc)
+        
+        # Create a grid of cases (4 rows of 6-7 cases each)
+        grid = []
         for i in range(1, 27):
             if i == game["player_case"]:
-                desc += f"💼 **[{i}]** (Your case)\n"
+                grid.append(f"🔒 **{i}**")
             elif i in game["opened_cases"]:
                 val = game["case_values"][i - 1]
-                desc += f"❌ Case {i}: ${val:,}\n"
+                grid.append(f"❌ ~~{i}~~")
             else:
-                desc += f"🧳 Case {i}\n"
-        embed = discord.Embed(title="📦 Deal or No Deal", description=desc, color=0x00ffcc)
-        embed.set_footer(text=f"Round {game['round']}")
+                grid.append(f"📦 {i}")
+        
+        # Split into rows
+        for row in [grid[i:i+7] for i in range(0, 26, 7)]:
+            embed.add_field(name="\u200b", value=" ".join(row), inline=False)
+        
+        # Show remaining values
+        remaining = self.get_remaining_values(game)
+        if remaining:
+            embed.add_field(name="Remaining Values", value=", ".join(f"${x:,}" for x in sorted(remaining)), inline=False)
+        
+        # Show progress bar
+        embed.add_field(name="Progress", value=self.build_progress_bar(game), inline=False)
+        
+        # Show current round and offers
+        if game["offers"]:
+            embed.set_footer(text=f"Round {game['round']} • Last offer: ${game['offers'][-1]:,}")
+        else:
+            embed.set_footer(text=f"Round {game['round']}")
         return embed
 
     @commands.group(invoke_without_command=True)
@@ -92,7 +177,19 @@ class DealOrNoDeal(commands.Cog):
 
         self.games[user_id] = self.create_new_game()
         self.save()
-        await ctx.send(f"${COST_TO_PLAY} deducted. 🎲 Please pick your case to keep with `!deal pick <case_number>` (1-26).")
+        
+        embed = discord.Embed(
+            title="🎲 Deal or No Deal Started!",
+            description=f"${COST_TO_PLAY} has been deducted from your account.",
+            color=0x00ffcc
+        )
+        embed.add_field(
+            name="Next Step",
+            value="Please pick your case to keep with `!deal pick <case_number>` (1-26).",
+            inline=False
+        )
+        embed.set_thumbnail(url="https://emojipedia-us.s3.dualstack.us-west-1.amazonaws.com/thumbs/120/twitter/259/game-die_1f3b2.png")
+        await ctx.send(embed=embed)
 
     @deal.command()
     async def pick(self, ctx, case: int):
@@ -108,7 +205,19 @@ class DealOrNoDeal(commands.Cog):
                 return
             game["player_case"] = case
             self.save()
-            await ctx.send(f"🎉 You chose case #{case} to keep. Now open cases with `!deal open <case_number>`.")
+            
+            embed = discord.Embed(
+                title="📦 Case Selected!",
+                description=f"You chose case #{case} to keep.",
+                color=0x00ffcc
+            )
+            embed.add_field(
+                name="Next Step",
+                value="Now open cases with `!deal open <case_number>`.",
+                inline=False
+            )
+            embed.set_thumbnail(url="https://emojipedia-us.s3.dualstack.us-west-1.amazonaws.com/thumbs/120/twitter/259/briefcase_1f4bc.png")
+            await ctx.send(embed=embed)
         else:
             await ctx.send("You've already picked your case.")
 
@@ -136,16 +245,56 @@ class DealOrNoDeal(commands.Cog):
             await ctx.send("Pick a valid case number between 1 and 26.")
             return
 
-        game["opened_cases"].append(case)
+        # Send loading message
+        msg = await ctx.send("🔍 Opening case...")
+        
+        # Add dramatic pause
+        await asyncio.sleep(1.5)
+        
         val = game["case_values"][case - 1]
-        await ctx.send(f"💼 Case #{case} had **${val:,}**")
-
+        game["opened_cases"].append(case)
+        
+        # Create reveal embed
+        embed = discord.Embed(
+            title=f"Case #{case} Revealed!",
+            description=f"💼 The case contained...",
+            color=0xff9900
+        )
+        embed.add_field(name="Value", value=f"**${val:,}**", inline=False)
+        
+        # Different reactions based on value
+        if val >= 100000:
+            embed.set_image(url="https://media.giphy.com/media/xT5LMHxhOfscxPfIfm/giphy.gif")
+        elif val <= 1:
+            embed.set_image(url="https://media.giphy.com/media/l0HU7JI8AfIdK5hxS/giphy.gif")
+        
+        await msg.edit(content=None, embed=embed)
+        
         remaining_unopened = 26 - len(game["opened_cases"]) - 1  # Exclude player's case
 
         if remaining_unopened == 1:
             game["final_stage"] = True
             self.save()
-            await ctx.send("🕵️ Only your case and one other remain. Do you want to `!deal swap` your case or keep it?")
+            
+            remaining_case = next(i for i in range(1, 27) if i != game["player_case"] and i not in game["opened_cases"])
+            
+            embed = discord.Embed(
+                title="🔄 Final Decision!",
+                description="Only your case and one other remain!",
+                color=0x00ffff
+            )
+            embed.add_field(
+                name="Your Case",
+                value=f"Case #{game['player_case']} (Unknown value)",
+                inline=True
+            )
+            embed.add_field(
+                name="Other Case",
+                value=f"Case #{remaining_case} (Unknown value)",
+                inline=True
+            )
+            embed.set_footer(text="Type `!deal swap` to switch or continue with your case")
+            await ctx.send(embed=embed)
             return
 
         opens_required = ROUND_STRUCTURE[game["round"] - 1]
@@ -153,7 +302,17 @@ class DealOrNoDeal(commands.Cog):
             offer = self.banker_offer(game)
             game["offers"].append(offer)
             self.save()
-            await ctx.send(f"☎️ The Banker offers: **${offer:,}**. Type `!deal accept` to accept or `!deal nodeal` to continue.")
+            
+            embed = discord.Embed(
+                title="☎️ Banker's Offer",
+                description=f"The Banker is offering you **${offer:,}**",
+                color=0xffff00
+            )
+            embed.add_field(name="Your options", value="✅ Accept this deal\n❌ Continue playing")
+            embed.set_footer(text=f"Round {game['round']}")
+            
+            view = DealButtons(self, user_id)
+            await ctx.send(embed=embed, view=view)
         else:
             self.save()
             await ctx.send(embed=self.build_case_embed(user_id))
@@ -173,6 +332,14 @@ class DealOrNoDeal(commands.Cog):
         offer = game["offers"][-1]
         payout = int(offer)
 
+        embed = discord.Embed(
+            title="💼 Deal Accepted!",
+            description=f"**You've accepted the banker's offer of ${offer:,}!**",
+            color=0x00ff00
+        )
+        embed.add_field(name="💰 Winnings", value=f"${payout:,} has been deposited to your account!")
+        embed.set_thumbnail(url="https://emojipedia-us.s3.dualstack.us-west-1.amazonaws.com/thumbs/120/twitter/259/money-bag_1f4b0.png")
+
         try:
             await bank.deposit_credits(ctx.author, payout)
         except Exception as e:
@@ -182,7 +349,7 @@ class DealOrNoDeal(commands.Cog):
         game["deal_taken"] = True
         self.games.pop(user_id)
         self.save()
-        await ctx.send(f"✅ You accepted the deal and won **${payout:,}**! Game over.")
+        await ctx.send(embed=embed)
 
     @deal.command()
     async def nodeal(self, ctx):
@@ -194,7 +361,15 @@ class DealOrNoDeal(commands.Cog):
         game = self.games[user_id]
         game["round"] += 1
         self.save()
-        await ctx.send("📦 No Deal! Continue opening cases with `!deal open <case_number>`.")
+        
+        embed = discord.Embed(
+            title="📦 No Deal!",
+            description="The game continues!",
+            color=0xff9900
+        )
+        embed.set_footer(text=f"Round {game['round']}")
+        await ctx.send(embed=embed)
+        await ctx.send(embed=self.build_case_embed(user_id))
 
     @deal.command()
     async def swap(self, ctx):
@@ -226,8 +401,29 @@ class DealOrNoDeal(commands.Cog):
 
         self.games.pop(user_id)
         self.save()
-        await ctx.send(f"🔄 You swapped your case #{game['player_case']} with case #{new_case}.")
-        await ctx.send(f"🎉 Your new case contained **${swapped_value:,}**! (Your original case had ${original_value:,})")
+        
+        embed = discord.Embed(
+            title="🔄 Case Swapped!",
+            description=f"You swapped your case #{game['player_case']} with case #{new_case}",
+            color=0x00ffcc
+        )
+        embed.add_field(
+            name="Your new case contained",
+            value=f"**${swapped_value:,}**",
+            inline=False
+        )
+        embed.add_field(
+            name="Your original case had",
+            value=f"${original_value:,}",
+            inline=False
+        )
+        
+        if swapped_value > original_value:
+            embed.set_thumbnail(url="https://emojipedia-us.s3.dualstack.us-west-1.amazonaws.com/thumbs/120/twitter/259/grinning-face-with-star-eyes_1f929.png")
+        else:
+            embed.set_thumbnail(url="https://emojipedia-us.s3.dualstack.us-west-1.amazonaws.com/thumbs/120/twitter/259/disappointed-face_1f61e.png")
+        
+        await ctx.send(embed=embed)
 
     @deal.command()
     async def forfeit(self, ctx):
@@ -235,6 +431,12 @@ class DealOrNoDeal(commands.Cog):
         if user_id in self.games:
             del self.games[user_id]
             self.save()
-            await ctx.send("Your game was cancelled.")
+            
+            embed = discord.Embed(
+                title="🚫 Game Cancelled",
+                description="Your Deal or No Deal game has been forfeited.",
+                color=0xff0000
+            )
+            await ctx.send(embed=embed)
         else:
             await ctx.send("You have no active game.")
