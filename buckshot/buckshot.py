@@ -3,7 +3,7 @@ import asyncio
 from typing import Optional, Dict, List
 
 import discord
-from redbot.core import commands, Config, checks
+from redbot.core import commands, Config, checks, bank
 from redbot.core.bot import Red
 from redbot.core.utils.chat_formatting import (
     box,
@@ -63,16 +63,17 @@ class BuckshotRoulette(commands.Cog):
         if bet > max_bet:
             return await ctx.send(f"Maximum bet is {humanize_number(max_bet)}!")
         
-        # Check user's balance
-        economy = self.bot.get_cog("Economy")
-        if not economy:
-            return await ctx.send("Economy cog is not loaded!")
-        
-        if not await economy.can_spend(author, bet):
-            return await ctx.send("You don't have enough credits to make that bet!")
-        
-        # Deduct bet amount
-        await economy.withdraw_credits(author, bet)
+        # Check user's balance using bank API
+        try:
+            if not await bank.can_spend(author, bet):
+                return await ctx.send("You don't have enough credits to make that bet!")
+            
+            # Deduct bet amount
+            await bank.withdraw_credits(author, bet)
+        except bank.errors.NoAccount:
+            return await ctx.send("You don't have a bank account!")
+        except Exception as e:
+            return await ctx.send(f"An error occurred: {e}")
         
         # Determine lives (2-4)
         min_lives = await self.config.guild(guild).min_lives()
@@ -361,23 +362,23 @@ class BuckshotRoulette(commands.Cog):
         guild = ctx.guild
         author = ctx.author
         
-        economy = self.bot.get_cog("Economy")
-        
         if player_won:
             winnings = game["current_pot"]
-            if economy:
-                await economy.deposit_credits(author, winnings)
-            
-            # Update leaderboard
-            async with self.config.guild(guild).leaderboard() as leaderboard:
-                user_id = str(author.id)
-                leaderboard[user_id] = leaderboard.get(user_id, 0) + 1
-            
-            await ctx.send(
-                f"🎉 **You win!**\n"
-                f"**Winnings:** {humanize_number(winnings)}\n"
-                f"**Total Pot:** {humanize_number(winnings)}"
-            )
+            try:
+                await bank.deposit_credits(author, winnings)
+                
+                # Update leaderboard
+                async with self.config.guild(guild).leaderboard() as leaderboard:
+                    user_id = str(author.id)
+                    leaderboard[user_id] = leaderboard.get(user_id, 0) + 1
+                
+                await ctx.send(
+                    f"🎉 **You win!**\n"
+                    f"**Winnings:** {humanize_number(winnings)}\n"
+                    f"**Total Pot:** {humanize_number(winnings)}"
+                )
+            except Exception as e:
+                await ctx.send(f"Couldn't deposit winnings: {e}")
         else:
             await ctx.send(
                 "💀 **You lost!** Better luck next time.\n"
