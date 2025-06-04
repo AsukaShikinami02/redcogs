@@ -1,4 +1,4 @@
 from .buckshot import BuckshotRoulette
 
-def setup(bot):
-    bot.add_cog(BuckshotRoulette(bot))
+async def setup(bot):
+   await bot.add_cog(BuckshotRoulette(bot))
