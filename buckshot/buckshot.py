@@ -1,509 +1,362 @@
+import discord
 import random
 import asyncio
-from typing import Optional, Dict, List
-
-import discord
-from redbot.core import commands, Config, checks, bank
+from redbot.core import commands, bank, Config
 from redbot.core.bot import Red
-from redbot.core.utils.chat_formatting import (
-    box,
-    pagify,
-    humanize_number,
-    humanize_list
-)
-from redbot.core.utils.menus import DEFAULT_CONTROLS, menu
+from redbot.core.utils.chat_formatting import box
 
 class BuckshotRoulette(commands.Cog):
-    """Play Buckshot Roulette against the bot - with realistic mechanics!"""
+    """Buckshot Roulette game with buttons, leaderboard, rematch, and stat resets."""
 
     def __init__(self, bot: Red):
         self.bot = bot
-        self.config = Config.get_conf(self, identifier=1234567891)
-        self.config.register_guild(
-            leaderboard={},
-            min_bet=100,
-            max_bet=10000,
-            min_lives=2,
-            max_lives=4,
-            min_shells=2,
-            max_shells=8
+        self.config = Config.get_conf(self, identifier=123456789012345678)
+        default_user = {
+            "wins": 0,
+            "losses": 0,
+            "draws": 0,
+            "games": 0,
+        }
+        self.config.register_user(**default_user)
+        self.active_games = {}  # user_id: game state
+
+    # --- Helper functions ---
+
+    def generate_shells(self):
+        # 8 shells, 2–5 live rounds randomly placed
+        lives = random.randint(2, 5)
+        blanks = 8 - lives
+        shells = [True] * lives + [False] * blanks
+        random.shuffle(shells)
+        return shells
+
+    def hearts(self, count):
+        return "❤️" * count + "🖤" * (4 - count)
+
+    def shell_emojis(self, shells):
+        return "".join("🔴" if s else "⚪" for s in shells)
+
+    def win_percentage(self, wins, games):
+        if games == 0:
+            return "0.0%"
+        return f"{(wins / games) * 100:.1f}%"
+
+    # --- Commands ---
+
+    @commands.command()
+    async def buckshot(self, ctx: commands.Context, amount: int):
+        """Start a game of Buckshot Roulette with a bet."""
+
+        if amount <= 0:
+            return await ctx.send("❌ Bet must be greater than zero.")
+        bal = await bank.get_balance(ctx.author)
+        if bal < amount:
+            return await ctx.send("❌ You don't have enough credits for that bet.")
+
+        if ctx.author.id in self.active_games:
+            return await ctx.send("⚠️ You already have an active game!")
+
+        # Withdraw bet immediately; if you lose you lose it, if win you get double later
+        await bank.withdraw_credits(ctx.author, amount)
+
+        # Setup initial game state
+        game = {
+            "user": ctx.author,
+            "bet": amount,
+            "user_lives": random.randint(2, 4),
+            "bot_lives": random.randint(2, 4),
+            "shells": self.generate_shells(),
+            "turn": 0,  # even=user, odd=bot
+            "log": [],
+            "message": None,
+            "channel": ctx.channel,
+            "rematch": False,
+        }
+        self.active_games[ctx.author.id] = game
+
+        await ctx.send(
+            f"🎲 **Buckshot Roulette started!** {ctx.author.mention} bets {amount} credits.\n"
+            f"Both you and the bot start with lives between 2 and 4.\n"
+            "On your turn, choose to shoot yourself 💀 or the dealer 🎯.\n"
+            "First to lose all lives loses the game."
         )
-        self.games = {}  # {channel_id: game_data}
 
-    async def red_delete_data_for_user(self, *, requester, user_id: int):
-        # Delete user's leaderboard data
-        for guild_id in await self.config.all_guilds():
-            async with self.config.guild_from_id(guild_id).leaderboard() as leaderboard:
-                if str(user_id) in leaderboard:
-                    del leaderboard[str(user_id)]
+        await asyncio.sleep(1.5)
+        await self.show_status(game)
+        await self.prompt_user(game)
 
-    @commands.group()
-    @commands.guild_only()
-    async def buckshot(self, ctx):
-        """Buckshot Roulette commands"""
+    # --- Game Flow ---
+
+    async def show_status(self, game):
+        shells_display = self.shell_emojis(game["shells"])
+        user_hearts = self.hearts(game["user_lives"])
+        bot_hearts = self.hearts(game["bot_lives"])
+        status = (
+            f"Shells left: {shells_display}\n"
+            f"🧍 {game['user'].mention}: {user_hearts} ({game['user_lives']} lives)\n"
+            f"🤖 Bot: {bot_hearts} ({game['bot_lives']} lives)\n"
+        )
+        if game["message"]:
+            await game["message"].edit(content=status, view=game["view"])
+        else:
+            game["message"] = await game["channel"].send(status)
+
+    async def prompt_user(self, game):
+        """Prompt user with buttons to choose shooting self or dealer."""
+        if game["user_lives"] <= 0 or game["bot_lives"] <= 0:
+            return await self.end_game(game)
+
+        # Check shells, reload if empty
+        if not game["shells"]:
+            game["shells"] = self.generate_shells()
+            await game["channel"].send("🔄 Chamber empty! Reloading shells...")
+
+        # Create buttons
+        view = BuckshotView(self, game)
+        game["view"] = view
+        content = (
+            f"Your turn, {game['user'].mention}!\n"
+            f"Choose who to shoot:"
+        )
+        if game["message"]:
+            await game["message"].edit(content=content, view=view)
+        else:
+            game["message"] = await game["channel"].send(content, view=view)
+
+    async def user_shoot(self, game, target):
+        """Process user's shot: 'self' or 'bot'."""
+        if not game["shells"]:
+            game["shells"] = self.generate_shells()
+            await game["channel"].send("🔄 Chamber empty! Reloading shells...")
+
+        shell = game["shells"].pop(0)
+        shooter = "You"
+        target_name = "yourself" if target == "self" else "the bot"
+
+        if shell:
+            # Live round, target loses a life
+            if target == "self":
+                game["user_lives"] -= 1
+                result = f"💥 {shooter} shot {target_name} — you lost a life!"
+            else:
+                game["bot_lives"] -= 1
+                result = f"💥 {shooter} shot {target_name} — bot lost a life!"
+        else:
+            result = f"*click* {shooter} shot {target_name} — no damage."
+
+        game["log"].append(result)
+        await game["channel"].send(result)
+        await asyncio.sleep(1.5)
+
+        # Check end of game
+        if game["user_lives"] <= 0 or game["bot_lives"] <= 0:
+            return await self.end_game(game)
+
+        # Bot turn next
+        await self.bot_turn(game)
+
+    async def bot_turn(self, game):
+        if game["user_lives"] <= 0 or game["bot_lives"] <= 0:
+            return await self.end_game(game)
+
+        if not game["shells"]:
+            game["shells"] = self.generate_shells()
+            await game["channel"].send("🔄 Chamber empty! Reloading shells...")
+
+        # Bot logic: simple AI — shoot player if bot lives > 1 else self (random)
+        if game["bot_lives"] > 1:
+            target = random.choices(["self", "user"], weights=[0.3, 0.7])[0]
+        else:
+            target = random.choice(["self", "user"])
+
+        shell = game["shells"].pop(0)
+
+        if shell:
+            if target == "self":
+                game["bot_lives"] -= 1
+                result = f"💥 Bot shot itself — bot lost a life!"
+            else:
+                game["user_lives"] -= 1
+                result = f"💥 Bot shot you — you lost a life!"
+        else:
+            result = f"*click* Bot shot {('itself' if target=='self' else 'you')} — no damage."
+
+        game["log"].append(result)
+        await game["channel"].send(result)
+        await asyncio.sleep(1.5)
+
+        if game["user_lives"] <= 0 or game["bot_lives"] <= 0:
+            return await self.end_game(game)
+
+        # Show status and prompt user again
+        await self.show_status(game)
+        await self.prompt_user(game)
+
+    async def end_game(self, game):
+        user = game["user"]
+        bet = game["bet"]
+        user_lives = game["user_lives"]
+        bot_lives = game["bot_lives"]
+        log = game["log"][-6:]  # last 6 logs
+
+        # Determine outcome
+        if user_lives > 0 and bot_lives <= 0:
+            outcome = "win"
+            await bank.deposit_credits(user, bet * 2)
+            msg = f"🎉 You won and earned {bet * 2} credits!"
+        elif bot_lives > 0 and user_lives <= 0:
+            outcome = "lose"
+            msg = f"💀 You lost {bet} credits. Better luck next time!"
+        else:
+            outcome = "draw"
+            await bank.deposit_credits(user, bet)  # refund bet on draw
+            msg = "🤝 It's a draw! Your bet has been returned."
+
+        # Update stats
+        async with self.config.user(user).all() as stats:
+            stats["games"] += 1
+            stats[outcome + "s"] += 1
+
+        # Clear active game
+        self.active_games.pop(user.id, None)
+
+        embed = discord.Embed(
+            title="🔚 Buckshot Roulette — Game Over",
+            color=discord.Color.green() if outcome == "win" else discord.Color.red() if outcome == "lose" else discord.Color.orange()
+        )
+        embed.add_field(name="Result", value=msg, inline=False)
+        embed.add_field(name="Your final lives", value=self.hearts(user_lives), inline=True)
+        embed.add_field(name="Bot final lives", value=self.hearts(bot_lives), inline=True)
+        embed.add_field(name="Last Actions", value="\n".join(log), inline=False)
+
+        await game["message"].edit(content=None, embed=embed, view=None)
+
+        # Send rematch buttons
+        await self.send_rematch_buttons(game)
+
+    async def send_rematch_buttons(self, game):
+        view = RematchView(self, game["bet"], game["user"])
+        await game["channel"].send(
+            f"{game['user'].mention}, would you like a rematch with the same bet ({game['bet']} credits)?",
+            view=view,
+        )
+
+    # --- Leaderboard and Stats Commands ---
+
+    @commands.command()
+    async def buckshotstats(self, ctx: commands.Context, user: discord.User = None):
+        """Show your or another user's Buckshot Roulette stats."""
+        user = user or ctx.author
+        stats = await self.config.user(user).all()
+        embed = discord.Embed(title=f"📊 Buckshot Stats — {user.display_name}", color=discord.Color.blurple())
+        embed.add_field(name="Wins", value=stats["wins"])
+        embed.add_field(name="Losses", value=stats["losses"])
+        embed.add_field(name="Draws", value=stats["draws"])
+        embed.add_field(name="Games Played", value=stats["games"])
+        win_pct = self.win_percentage(stats["wins"], stats["games"])
+        embed.add_field(name="Win Percentage", value=win_pct)
+        await ctx.send(embed=embed)
+
+    @commands.command()
+    async def buckshotleaderboard(self, ctx: commands.Context):
+        """Show the Buckshot Roulette leaderboard."""
+        all_data = await self.config.all_users()
+
+        # Filter users who played
+        filtered = {
+            user_id: data for user_id, data in all_data.items() if data.get("games", 0) > 0
+        }
+
+        if not filtered:
+            return await ctx.send("No games have been played yet.")
+
+        # Sort by wins descending
+        sorted_data = sorted(filtered.items(), key=lambda x: x[1]["wins"], reverse=True)[:10]
+
+        lines = []
+        for user_id, data in sorted_data:
+            member = ctx.guild.get_member(user_id) or await self.bot.fetch_user(user_id)
+            name = member.display_name if member else f"User ID {user_id}"
+            wins = data["wins"]
+            losses = data["losses"]
+            draws = data["draws"]
+            games = data["games"]
+            win_pct = self.win_percentage(wins, games)
+            lines.append(f"{name:<15} | {wins:^4} | {losses:^6} | {draws:^5} | {win_pct:^7}")
+
+        header = "Player          | Wins | Losses | Draws | Win %\n" + "-" * 45
+        content = header + "\n" + "\n".join(lines)
+        await ctx.send(box(content, lang="ansi"))
+
+    @commands.command()
+    @commands.is_owner()
+    async def buckshotresetdaily(self, ctx: commands.Context):
+        """Reset all users' Buckshot Roulette stats (daily reset)."""
+        all_data = await self.config.all_users()
+        for user_id in all_data:
+            await self.config.user_from_id(user_id).set({
+                "wins": 0,
+                "losses": 0,
+                "draws": 0,
+                "games": 0,
+            })
+        await ctx.send("✅ All Buckshot Roulette stats have been reset (daily).")
+
+    @commands.command()
+    @commands.is_owner()
+    async def buckshotresetweekly(self, ctx: commands.Context):
+        """Reset all users' Buckshot Roulette stats (weekly reset)."""
+        # Same as daily for now, can customize
+        await self.buckshotresetdaily(ctx)
+
+    # --- Rematch ---
+
+    @commands.Cog.listener()
+    async def on_interaction(self, interaction: discord.Interaction):
+        # To ensure interactions outside our views don't cause errors
         pass
 
-    @buckshot.command(name="start")
-    async def start_game(self, ctx, bet: int):
-        """Start a new Buckshot Roulette game with a bet"""
-        guild = ctx.guild
-        channel = ctx.channel
-        author = ctx.author
-        
-        # Check if game already in progress
-        if channel.id in self.games:
-            return await ctx.send("A game is already in progress in this channel!")
-        
-        # Validate bet amount
-        min_bet = await self.config.guild(guild).min_bet()
-        max_bet = await self.config.guild(guild).max_bet()
-        
-        if bet < min_bet:
-            return await ctx.send(f"Minimum bet is {humanize_number(min_bet)}!")
-        if bet > max_bet:
-            return await ctx.send(f"Maximum bet is {humanize_number(max_bet)}!")
-        
-        # Check user's balance using bank API
-        try:
-            if not await bank.can_spend(author, bet):
-                return await ctx.send("You don't have enough credits to make that bet!")
-            
-            # Deduct bet amount
-            await bank.withdraw_credits(author, bet)
-        except bank.errors.NoAccount:
-            return await ctx.send("You don't have a bank account!")
-        except Exception as e:
-            return await ctx.send(f"An error occurred: {e}")
-        
-        # Determine lives (2-4)
-        min_lives = await self.config.guild(guild).min_lives()
-        max_lives = await self.config.guild(guild).max_lives()
-        lives = random.randint(min_lives, max_lives)
-        
-        # Initialize game
-        self.games[channel.id] = {
-            "player": author.id,
-            "bet": bet,
-            "current_pot": bet,
-            "round": 1,
-            "shells": [],
-            "position": 0,
-            "player_lives": lives,
-            "bot_lives": lives,
-            "items": {
-                "player": ["handcuffs", "beer", "magnifier"],
-                "bot": ["handcuffs", "beer", "magnifier"]
-            },
-            "handcuffed": False
-        }
-        
-        await self._load_gun(channel.id, guild)
-        game = self.games[channel.id]
-        await ctx.send(
-            f"🔫 **Buckshot Roulette - Round 1**\n"
-            f"**Bet:** {humanize_number(bet)}\n"
-            f"**Current Pot:** {humanize_number(bet)}\n"
-            f"**Lives:** You: {'❤️' * lives} | Bot: {'❤️' * lives}\n"
-            f"**Items:** {humanize_list(game['items']['player'])}\n\n"
-            f"Type `{ctx.prefix}buckshot shoot self` or `{ctx.prefix}buckshot shoot bot` to take your shot.\n"
-            f"Use `{ctx.prefix}buckshot use <item>` to use an item.\n"
-            f"Type `{ctx.prefix}buckshot quit` to forfeit and lose your bet."
-        )
+class BuckshotView(discord.ui.View):
+    def __init__(self, cog, game):
+        super().__init__(timeout=60)
+        self.cog = cog
+        self.game = game
 
-    @buckshot.command(name="shoot")
-    async def shoot(self, ctx, target: str):
-        """Take your turn and shoot yourself or the bot
-        Usage: [p]buckshot shoot <self/bot>"""
-        channel = ctx.channel
-        author = ctx.author
-        
-        # Check if game exists
-        if channel.id not in self.games:
-            return await ctx.send("No game in progress! Start one with `buckshot start`.")
-        
-        game = self.games[channel.id]
-        
-        # Check if it's the player's turn
-        if game["player"] != author.id:
-            return await ctx.send("It's not your game!")
-        
-        # Check if game is already over
-        if game["player_lives"] <= 0 or game["bot_lives"] <= 0:
-            return await ctx.send("The game is already over!")
-        
-        # Check if player is handcuffed
-        if game["handcuffed"]:
-            game["handcuffed"] = False
-            return await ctx.send("You're handcuffed and can't shoot this turn!")
-        
-        # Validate target
-        target = target.lower()
-        if target not in ["self", "bot"]:
-            return await ctx.send("Please specify `self` or `bot` as the target.")
-        
-        # Player shoots
-        await ctx.send(f"🔫 You point the gun at {'yourself' if target == 'self' else 'the bot'} and pull the trigger...")
-        await asyncio.sleep(2)
-        
-        shell = game["shells"][game["position"]]
-        game["position"] += 1
-        
-        if shell == "blank":
-            result_msg = "*Click* It's a blank!"
-            if target == "self":
-                result_msg += " You survive."
-            else:
-                result_msg += " The bot survives."
-            await ctx.send(result_msg)
-        else:
-            if target == "self":
-                game["player_lives"] -= 1
-                result_msg = "💥 **BANG!** It's a live round! You lose a life."
-                if game["player_lives"] <= 0:
-                    await self._end_game(ctx, game, False)
-                    return
-            else:
-                game["bot_lives"] -= 1
-                result_msg = "💥 **BANG!** It's a live round! The bot loses a life."
-                if game["bot_lives"] <= 0:
-                    await self._end_game(ctx, game, True)
-                    return
-            
-            await ctx.send(result_msg)
-        
-        # Show status
-        await ctx.send(
-            f"**Lives Remaining:** You: {'❤️' * game['player_lives']} | "
-            f"Bot: {'❤️' * game['bot_lives']}\n"
-            f"**Shells Left:** {len(game['shells']) - game['position']}"
-        )
-        
-        # Check if we need to reload
-        if game["position"] >= len(game["shells"]):
-            await self._next_round(ctx, game)
-        else:
-            await self._bot_turn(ctx, game)
-    
-    async def _bot_turn(self, ctx, game):
-        """Bot's turn to shoot"""
-        channel = ctx.channel
-        
-        # Bot uses items randomly (33% chance)
-        if random.random() < 0.33 and game["items"]["bot"]:
-            item = random.choice(game["items"]["bot"])
-            await self._use_bot_item(ctx, game, item)
-            return
-        
-        # Bot chooses target (weighted 70% to shoot player)
-        target = "player" if random.random() < 0.7 else "self"
-        
-        await ctx.send(f"\n🤖 The bot takes the gun and points it at {'itself' if target == 'self' else 'you'}...")
-        await asyncio.sleep(2)
-        
-        shell = game["shells"][game["position"]]
-        game["position"] += 1
-        
-        if shell == "blank":
-            result_msg = "*Click* It's a blank!"
-            if target == "self":
-                result_msg += " The bot survives."
-            else:
-                result_msg += " You survive."
-            await ctx.send(result_msg)
-        else:
-            if target == "self":
-                game["bot_lives"] -= 1
-                result_msg = "💥 **BANG!** It's a live round! The bot loses a life."
-                if game["bot_lives"] <= 0:
-                    await self._end_game(ctx, game, True)
-                    return
-            else:
-                game["player_lives"] -= 1
-                result_msg = "💥 **BANG!** It's a live round! You lose a life."
-                if game["player_lives"] <= 0:
-                    await self._end_game(ctx, game, False)
-                    return
-            
-            await ctx.send(result_msg)
-        
-        # Show status
-        await ctx.send(
-            f"**Lives Remaining:** You: {'❤️' * game['player_lives']} | "
-            f"Bot: {'❤️' * game['bot_lives']}\n"
-            f"**Shells Left:** {len(game['shells']) - game['position']}"
-        )
-        
-        # Check if we need to reload
-        if game["position"] >= len(game["shells"]):
-            await self._next_round(ctx, game)
-        else:
-            await ctx.send(f"\nYour turn! Type `{ctx.prefix}buckshot shoot self` or `{ctx.prefix}buckshot shoot bot`")
-    
-    async def _use_bot_item(self, ctx, game, item):
-        """Bot uses an item"""
-        if item not in game["items"]["bot"]:
-            return
-        
-        game["items"]["bot"].remove(item)
-        
-        if item == "handcuffs":
-            game["handcuffed"] = True
-            await ctx.send("🤖 The bot uses **handcuffs** on you! You'll be unable to act next turn.")
-        elif item == "beer":
-            # Remove current shell
-            if game["position"] < len(game["shells"]):
-                removed_shell = game["shells"].pop(game["position"])
-                await ctx.send(f"🤖 The bot uses **beer** to eject a {removed_shell} shell!")
-            else:
-                await ctx.send("🤖 The bot tries to use **beer** but there are no shells left!")
-        elif item == "magnifier":
-            if game["position"] < len(game["shells"]):
-                next_shell = game["shells"][game["position"]]
-                await ctx.send(f"🤖 The bot uses **magnifier** and sees the next shell is a {next_shell}!")
-            else:
-                await ctx.send("🤖 The bot tries to use **magnifier** but there are no shells left!")
-        
-        # Continue with bot's turn
-        await self._bot_turn(ctx, game)
-    
-    async def _next_round(self, ctx, game):
-        """Advance to the next round"""
-        channel = ctx.channel
-        game["round"] += 1
-        game["current_pot"] *= 2
-        await self._load_gun(channel.id, ctx.guild)
-        
-        # Refresh items every 2 rounds
-        if game["round"] % 2 == 1:
-            game["items"]["player"].extend(["handcuffs", "beer", "magnifier"])
-            game["items"]["bot"].extend(["handcuffs", "beer", "magnifier"])
-            # Ensure no more than 3 of each item
-            game["items"]["player"] = game["items"]["player"][:3]
-            game["items"]["bot"] = game["items"]["bot"][:3]
-        
-        await ctx.send(
-            f"🔫 **Round {game['round']}**\n"
-            f"**Current Pot:** {humanize_number(game['current_pot'])}\n"
-            f"**Lives:** You: {'❤️' * game['player_lives']} | Bot: {'❤️' * game['bot_lives']}\n"
-            f"**Items:** {humanize_list(game['items']['player'])}\n\n"
-            f"Type `{ctx.prefix}buckshot shoot self` or `{ctx.prefix}buckshot shoot bot` to take your turn."
-        )
+    @discord.ui.button(label="💀 Shoot Self", style=discord.ButtonStyle.danger)
+    async def shoot_self(self, button: discord.ui.Button, interaction: discord.Interaction):
+        if interaction.user.id != self.game["user"].id:
+            return await interaction.response.send_message("This is not your game!", ephemeral=True)
+        await interaction.response.defer()
+        self.stop()
+        await self.cog.user_shoot(self.game, "self")
 
-    async def _load_gun(self, channel_id: int, guild: discord.Guild):
-        """Load the gun with random shells (2-8 shells, at least 1 live and 1 blank)"""
-        game = self.games[channel_id]
-        
-        min_shells = await self.config.guild(guild).min_shells()
-        max_shells = await self.config.guild(guild).max_shells()
-        num_shells = random.randint(min_shells, max_shells)
-        
-        # Ensure at least 1 live and 1 blank
-        live_rounds = random.randint(1, num_shells - 1)
-        blanks = num_shells - live_rounds
-        
-        # Create shell list
-        shells = ["live"] * live_rounds + ["blank"] * blanks
-        random.shuffle(shells)
-        
-        game["shells"] = shells
-        game["position"] = 0
-        
-    @buckshot.command(name="use")
-    async def use_item(self, ctx, item: str):
-        """Use an item (handcuffs, beer, magnifier)"""
-        channel = ctx.channel
-        author = ctx.author
-        
-        # Check if game exists
-        if channel.id not in self.games:
-            return await ctx.send("No game in progress!")
-        
-        game = self.games[channel.id]
-        
-        # Check if it's the player's turn
-        if game["player"] != author.id:
-            return await ctx.send("It's not your game!")
-        
-        # Check if game is already over
-        if game["player_lives"] <= 0 or game["bot_lives"] <= 0:
-            return await ctx.send("The game is already over!")
-        
-        item = item.lower()
-        
-        # Check if player has the item
-        if item not in game["items"]["player"]:
-            return await ctx.send(f"You don't have a {item}!")
-        
-        game["items"]["player"].remove(item)
-        
-        if item == "handcuffs":
-            game["handcuffed"] = True
-            await ctx.send("🔒 You use **handcuffs** on the bot! It will be unable to act next turn.")
-            await self._bot_turn(ctx, game)
-        elif item == "beer":
-            # Remove current shell
-            if game["position"] < len(game["shells"]):
-                removed_shell = game["shells"].pop(game["position"])
-                await ctx.send(f"🍺 You use **beer** to eject a {removed_shell} shell!")
-            else:
-                await ctx.send("🍺 You try to use **beer** but there are no shells left!")
-            await self._bot_turn(ctx, game)
-        elif item == "magnifier":
-            if game["position"] < len(game["shells"]):
-                next_shell = game["shells"][game["position"]]
-                await ctx.send(f"🔍 You use **magnifier** and see the next shell is a {next_shell}!")
-            else:
-                await ctx.send("🔍 You try to use **magnifier** but there are no shells left!")
-            await ctx.send(f"Type `{ctx.prefix}buckshot shoot self` or `{ctx.prefix}buckshot shoot bot` to continue.")
-    
-    async def _end_game(self, ctx, game, player_won: bool):
-        """End the game and distribute winnings"""
-        channel = ctx.channel
-        guild = ctx.guild
-        author = ctx.author
-        
-        if player_won:
-            winnings = game["current_pot"]
-            try:
-                await bank.deposit_credits(author, winnings)
-                
-                # Update leaderboard
-                async with self.config.guild(guild).leaderboard() as leaderboard:
-                    user_id = str(author.id)
-                    leaderboard[user_id] = leaderboard.get(user_id, 0) + 1
-                
-                await ctx.send(
-                    f"🎉 **You win!**\n"
-                    f"**Winnings:** {humanize_number(winnings)}\n"
-                    f"**Total Pot:** {humanize_number(winnings)}"
-                )
-            except Exception as e:
-                await ctx.send(f"Couldn't deposit winnings: {e}")
-        else:
-            await ctx.send(
-                "💀 **You lost!** Better luck next time.\n"
-                f"**Lost Bet:** {humanize_number(game['bet'])}"
-            )
-        
-        # Clean up game
-        del self.games[channel.id]
-    
-    @buckshot.command(name="quit")
-    async def quit_game(self, ctx):
-        """Quit the current game and lose your bet"""
-        channel = ctx.channel
-        author = ctx.author
-        
-        if channel.id not in self.games:
-            return await ctx.send("No game in progress!")
-        
-        game = self.games[channel.id]
-        
-        if game["player"] != author.id:
-            return await ctx.send("It's not your game to quit!")
-        
-        await ctx.send(
-            "🏳️ You forfeited the game and lost your bet.\n"
-            f"**Lost Bet:** {humanize_number(game['bet'])}"
-        )
-        
-        # Clean up game
-        del self.games[channel.id]
-    
-    @buckshot.command(name="leaderboard", aliases=["lb"])
-    async def show_leaderboard(self, ctx):
-        """Show the Buckshot Roulette leaderboard"""
-        leaderboard = await self.config.guild(ctx.guild).leaderboard()
-        
-        if not leaderboard:
-            return await ctx.send("No games have been won yet!")
-        
-        # Sort leaderboard
-        sorted_lb = sorted(
-            leaderboard.items(),
-            key=lambda x: x[1],
-            reverse=True
-        )
-        
-        # Format entries
-        entries = []
-        for i, (user_id, wins) in enumerate(sorted_lb, 1):
-            user = ctx.guild.get_member(int(user_id))
-            username = user.display_name if user else f"Unknown User ({user_id})"
-            entries.append(f"{i}. {username}: {humanize_number(wins)} wins")
-        
-        # Pagify if needed
-        pages = []
-        for page in pagify("\n".join(entries)):
-            pages.append(box(page, lang="md"))
-        
-        if len(pages) == 1:
-            await ctx.send(f"**Buckshot Roulette Leaderboard**\n{pages[0]}")
-        else:
-            await menu(ctx, pages, DEFAULT_CONTROLS)
-    
-    @buckshot.command(name="stats")
-    async def player_stats(self, ctx, user: Optional[discord.Member] = None):
-        """Check your or another player's stats"""
-        user = user or ctx.author
-        leaderboard = await self.config.guild(ctx.guild).leaderboard()
-        wins = leaderboard.get(str(user.id), 0)
-        
-        await ctx.send(
-            f"**{user.display_name}'s Buckshot Roulette Stats**\n"
-            f"🏆 **Wins:** {humanize_number(wins)}"
-        )
-    
-    @checks.admin_or_permissions(manage_guild=True)
-    @buckshot.command(name="setlimits")
-    async def set_bet_limits(self, ctx, min_bet: int, max_bet: int):
-        """Set the minimum and maximum bet amounts"""
-        if min_bet < 0 or max_bet < 0:
-            return await ctx.send("Bet amounts cannot be negative!")
-        if min_bet > max_bet:
-            return await ctx.send("Minimum bet cannot be higher than maximum bet!")
-        
-        await self.config.guild(ctx.guild).min_bet.set(min_bet)
-        await self.config.guild(ctx.guild).max_bet.set(max_bet)
-        
-        await ctx.send(
-            f"Bet limits updated:\n"
-            f"**Minimum:** {humanize_number(min_bet)}\n"
-            f"**Maximum:** {humanize_number(max_bet)}"
-        )
-    
-    @checks.admin_or_permissions(manage_guild=True)
-    @buckshot.command(name="setlives")
-    async def set_lives_range(self, ctx, min_lives: int, max_lives: int):
-        """Set the minimum and maximum lives range"""
-        if min_lives < 1 or max_lives < 1:
-            return await ctx.send("Lives cannot be less than 1!")
-        if min_lives > max_lives:
-            return await ctx.send("Minimum lives cannot be higher than maximum lives!")
-        
-        await self.config.guild(ctx.guild).min_lives.set(min_lives)
-        await self.config.guild(ctx.guild).max_lives.set(max_lives)
-        
-        await ctx.send(
-            f"Lives range updated:\n"
-            f"**Minimum:** {min_lives}\n"
-            f"**Maximum:** {max_lives}"
-        )
-    
-    @checks.admin_or_permissions(manage_guild=True)
-    @buckshot.command(name="setshells")
-    async def set_shells_range(self, ctx, min_shells: int, max_shells: int):
-        """Set the minimum and maximum shells range"""
-        if min_shells < 2 or max_shells < 2:
-            return await ctx.send("Must have at least 2 shells!")
-        if min_shells > max_shells:
-            return await ctx.send("Minimum shells cannot be higher than maximum shells!")
-        
-        await self.config.guild(ctx.guild).min_shells.set(min_shells)
-        await self.config.guild(ctx.guild).max_shells.set(max_shells)
-        
-        await ctx.send(
-            f"Shells range updated:\n"
-            f"**Minimum:** {min_shells}\n"
-            f"**Maximum:** {max_shells}"
-        )
+    @discord.ui.button(label="🎯 Shoot Dealer", style=discord.ButtonStyle.primary)
+    async def shoot_bot(self, button: discord.ui.Button, interaction: discord.Interaction):
+        if interaction.user.id != self.game["user"].id:
+            return await interaction.response.send_message("This is not your game!", ephemeral=True)
+        await interaction.response.defer()
+        self.stop()
+        await self.cog.user_shoot(self.game, "bot")
+
+class RematchView(discord.ui.View):
+    def __init__(self, cog, bet, user):
+        super().__init__(timeout=60)
+        self.cog = cog
+        self.bet = bet
+        self.user = user
+
+    @discord.ui.button(label="🔁 Rematch", style=discord.ButtonStyle.success)
+    async def rematch(self, button: discord.ui.Button, interaction: discord.Interaction):
+        if interaction.user.id != self.user.id:
+            return await interaction.response.send_message("This is not your game!", ephemeral=True)
+        await interaction.response.defer()
+        self.stop()
+        await self.cog.buckshot.callback(self.cog, interaction, self.bet)
+
+    @discord.ui.button(label="❌ Cancel", style=discord.ButtonStyle.secondary)
+    async def cancel(self, button: discord.ui.Button, interaction: discord.Interaction):
+        if interaction.user.id != self.user.id:
+            return await interaction.response.send_message("This is not your game!", ephemeral=True)
+        await interaction.response.defer()
+        self.stop()
+        await interaction.message.edit(content="Rematch cancelled.", view=None)
