@@ -2,7 +2,8 @@ import discord
 from discord.ext import commands 
 from redbot.core import commands as red_commands, bank, Config
 from redbot.core.utils.views import ConfirmView 
-import random from typing import List
+import random 
+from typing import List
 
 class BuckshotView(discord.ui.View): 
 def init(self, cog, ctx, bet, player_lives, bot_lives): super().init(timeout=60)
