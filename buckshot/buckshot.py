@@ -94,7 +94,7 @@ async def buckshot(self, ctx: commands.Context, amount: int):
 @red_commands.command()
 async def buckshotlb(self, ctx: commands.Context):
     all_data = await self.config.all_users()
-    sorted_data = sorted(all_data.items(), key=lambda kv: ((kv[1].get("wins", 0) / (kv[1].get("wins", 0) + kv[1].get("losses", 0))) if (kv[1].get("wins", 0) + kv[1].get("losses", 0)) > 0 else 0), reverse=True)
+    sorted_data = sorted(all_data.items(), key=lambda kv: (kv[1].get("wins", 0) / (kv[1].get("wins", 0) + kv[1].get("losses", 0))) if (kv[1].get("wins", 0) + kv[1].get("losses", 0)) > 0 else 0, reverse=True)
 
     lines = []
     for idx, (user_id, stats) in enumerate(sorted_data[:10], start=1):
