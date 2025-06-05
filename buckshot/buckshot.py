@@ -2,7 +2,8 @@ import discord
 from discord.ext import commands from redbot.core import commands as red_commands, bank, Config from redbot.core.utils.views import ConfirmView import random from typing import List
 
 class BuckshotView(discord.ui.View): 
-def init(self, cog, ctx, bet, player_lives, bot_lives): super().init(timeout=60) self.cog = cog self.ctx = ctx self.bet = bet self.player_lives = player_lives self.bot_lives = bot_lives self.shells = self._load_shells() self.current_index = 0 self.message = None
+def init(self, cog, ctx, bet, player_lives, bot_lives): super().init(timeout=60)
+self.cog = cog self.ctx = ctx self.bet = bet self.player_lives = player_lives self.bot_lives = bot_lives self.shells = self._load_shells() self.current_index = 0 self.message = None
 
 def _load_shells(self):
     lives = random.randint(2, 6)
