@@ -15,7 +15,7 @@ class RedRadio(commands.Cog):
         self.config = Config.get_conf(self, identifier=90210, force_registration=True)
         self.config.register_guild(stream_url=None, track_channel=None)
         self.stations = []
-        self.last_title = {}  # Store last titles per guild
+        self.last_title = {}
         self.track_task = self.bot.loop.create_task(self.trackinfo_loop())
 
     def cog_unload(self):
@@ -29,29 +29,23 @@ class RedRadio(commands.Cog):
             async with self.session.get(stream_url, headers=headers, timeout=10) as resp:
                 metaint = int(resp.headers.get("icy-metaint", 0))
                 if metaint == 0:
-                    print("[DEBUG] No icy-metaint found — no metadata in this stream.")
                     return None
-    
-                # Read exactly enough bytes to get metadata
+
                 buffer = b""
                 while len(buffer) < metaint + 256:
                     chunk = await resp.content.read(metaint + 256 - len(buffer))
                     if not chunk:
                         break
                     buffer += chunk
-    
+
                 if len(buffer) < metaint + 1:
-                    print("[DEBUG] Not enough data to read metadata length byte.")
                     return None
-    
+
                 metadata_length = buffer[metaint] * 16
                 if len(buffer) < metaint + 1 + metadata_length:
-                    print("[DEBUG] Not enough metadata bytes to parse content.")
                     return None
-    
+
                 metadata_content = buffer[metaint + 1:metaint + 1 + metadata_length].decode("utf-8", errors="ignore")
-                print(f"[DEBUG] Metadata content: {metadata_content}")
-    
                 match = re.search(r"StreamTitle='(.*?)';", metadata_content)
                 if match:
                     title = match.group(1).strip()
@@ -61,11 +55,9 @@ class RedRadio(commands.Cog):
                         artist, song = None, title
                     return {"title": song.strip(), "artist": artist.strip() if artist else None}
         except Exception as e:
-                print(f"[Metadata] Failed to get ICY metadata: {e}")
+            print(f"[Metadata] Failed to get ICY metadata: {e}")
         return None
-            
-   
-    
+
     @commands.command()
     async def searchstations(self, ctx, *, query: str):
         url = f"https://de2.api.radio-browser.info/json/stations/byname/{query}"
@@ -74,16 +66,16 @@ class RedRadio(commands.Cog):
                 await ctx.send("Failed to fetch stations.")
                 return
             self.stations = await resp.json()
-    
+
         if not self.stations:
             await ctx.send("No stations found.")
             return
-    
-        self.stations = self.stations[:50]  # Limit to 50 results
+
+        self.stations = self.stations[:50]
         pages = [self.stations[i:i + 10] for i in range(0, len(self.stations), 10)]
         total_pages = len(pages)
         current_page = 0
-    
+
         def make_embed(current):
             embed = discord.Embed(
                 title=f"🔎 Results for '{query}' (Page {current + 1}/{total_pages})",
@@ -98,19 +90,19 @@ class RedRadio(commands.Cog):
                 embed.add_field(name=name[:256], value=value[:1024], inline=False)
             embed.set_footer(text="Use AS!playstation <number> to play.")
             return embed
-    
+
         message = await ctx.send(embed=make_embed(current_page))
         reactions = ["⏮️", "◀️", "▶️", "⏭️"]
         for r in reactions:
             await message.add_reaction(r)
-    
+
         def check(reaction, user):
             return (
                 user == ctx.author
                 and reaction.message.id == message.id
                 and str(reaction.emoji) in reactions
             )
-    
+
         while True:
             try:
                 reaction, user = await self.bot.wait_for("reaction_add", timeout=60.0, check=check)
@@ -127,13 +119,12 @@ class RedRadio(commands.Cog):
                 await message.remove_reaction(reaction, user)
             except asyncio.TimeoutError:
                 break
-    
+
         try:
             await message.clear_reactions()
         except discord.Forbidden:
             pass
 
-    
     @commands.command()
     async def playstation(self, ctx, index: int):
         if not self.stations:
@@ -182,13 +173,12 @@ class RedRadio(commands.Cog):
             description="The radio stream has been stopped.",
             color=discord.Color.red()
         ))
+        await self.bot.change_presence(activity=None)
 
     async def trackinfo_loop(self):
         await self.bot.wait_until_ready()
         while self.bot.is_ready():
-            print(f"[{datetime.datetime.now()}] Sleeping for 10 seconds...")
             await asyncio.sleep(10)
-            print(f"[{datetime.datetime.now()}] Checking metadata...")
             for guild in self.bot.guilds:
                 try:
                     stream_url = await self.config.guild(guild).stream_url()
@@ -201,27 +191,30 @@ class RedRadio(commands.Cog):
                         continue
 
                     metadata = await self.get_stream_metadata(stream_url)
-                    print(f"[{guild.name}] Got metadata: {metadata}")
                     if not metadata:
                         continue
 
                     artist = metadata.get("artist")
                     title = metadata.get("title")
-                    print(f"[{guild.name}] Last title: {self.last_title.get(guild.id)}")
+                    combined = f"{artist} - {title}" if artist else title
 
-                    if not title or self.last_title.get(guild.id) == title:
+                    if not title or self.last_title.get(guild.id) == combined:
                         continue
 
-                    self.last_title[guild.id] = title
-                    print(f"[{guild.name}] Sending update to #{channel.name}")
+                    self.last_title[guild.id] = combined
+
+                    # Update bot presence
+                    try:
+                        await self.bot.change_presence(activity=discord.Game(name=combined))
+                    except Exception as e:
+                        print(f"[Presence] Failed to update: {e}")
 
                     embed = discord.Embed(
                         title="🎶 Now Playing",
                         description=f"**{title}** by **{artist}**" if artist else title,
                         color=discord.Color.teal()
                     )
-
                     await channel.send(embed=embed)
 
                 except Exception as e:
-                    print(f"[Radio TrackInfo Loop] Error in guild {guild.id}: {e}")
+                    print(f"[TrackInfo] Error in guild {guild.id}: {e}")
