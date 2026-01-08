@@ -203,7 +203,7 @@ class UnifiedAudioRadio(commands.Cog):
     # -------------------------
     def _current_track_text_from_audio(self, guild: discord.Guild) -> str:
         """
-        Best-effort: prefer Red Lavalink player metadata.
+        Best-effort: prefer Lavalink player metadata.
         Falls back to probing guild.voice_client if lavalink isn't available.
 
         Returns a blob containing title/author/uri/etc, or "" if nothing accessible.
@@ -259,11 +259,12 @@ class UnifiedAudioRadio(commands.Cog):
                 return True
         return False
 
-    def _ll_listener(self, player: Any, event: Any, *args: Any, **kwargs: Any) -> None:
+    # IMPORTANT: must be a coroutine for lavalink.register_event_listener
+    async def _ll_listener(self, player: Any, event: Any, *args: Any, **kwargs: Any) -> None:
         try:
-            self.bot.loop.create_task(self._handle_lavalink_event(player, event))
+            await self._handle_lavalink_event(player, event)
         except Exception:
-            pass
+            log.exception("Lavalink listener error")
 
     async def _handle_lavalink_event(self, player: Any, event: Any) -> None:
         """
@@ -317,7 +318,6 @@ class UnifiedAudioRadio(commands.Cog):
                 return
 
             if self._text_matches_blocklist(blob, blocked):
-                # Stop immediately (non-panic). Use rrpanic manually if you hear something unsafe.
                 ll = self._get_lavalink()
                 if ll:
                     try:
