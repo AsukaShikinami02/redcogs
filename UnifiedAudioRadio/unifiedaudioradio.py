@@ -86,10 +86,12 @@ class UnifiedAudioRadio(commands.Cog):
     - rrunlock = clears panic + homes + resumes playback from BOTH sources (whichever was active at panic),
                 with fallback attempts (YouTube first if we have it, then radio).
 
-    NEW (per your request):
-    - block_tags_csv is now enforced for BOTH:
-        * Radio: station.tags + station.name (already)
-        * YouTube: (a) pre-play filter on typed query/link, AND (b) watchdog post-resolve filter on actual track metadata
+    FILTERS (per your request):
+    - block_tags_csv is enforced for BOTH:
+        * Radio: station.tags + station.name (radio-browser search filter)
+        * YouTube: (a) pre-play filter on typed query/link, AND
+                  (b) lavalink TRACK_START filter on resolved track metadata (direct-link safe),
+                  (c) watchdog post-resolve best-effort fallback.
     """
 
     AUDIO_SUMMON_ALIASES: Set[str] = {"summon", "join", "connect"}
@@ -134,12 +136,12 @@ class UnifiedAudioRadio(commands.Cog):
             last_youtube_query=None,  # query/link fed back into Audio play
 
             # panic resume snapshot (what was active when panic engaged)
-            panic_resume_kind=None,           # "youtube" | "radio" | None
+            panic_resume_kind=None,  # "youtube" | "radio" | None
             panic_resume_station_name=None,
             panic_resume_station_url=None,
             panic_resume_youtube_query=None,
 
-            # filters (now applies to BOTH radio and youtube)
+            # filters (applies to BOTH radio and youtube)
             min_bitrate_kbps=64,
             block_tags_csv="phonk,earrape,nsfw",
 
@@ -172,6 +174,9 @@ class UnifiedAudioRadio(commands.Cog):
         self._last_reassure_in_vc_ts: float = 0.0
         self._last_reassure_out_vc_ts: float = 0.0
 
+        # Lavalink event hook registration state
+        self._ll_registered: bool = False
+
     # -------------------------
     # Blocklist helpers (Radio + YouTube)
     # -------------------------
@@ -185,6 +190,9 @@ class UnifiedAudioRadio(commands.Cog):
     async def _blocked_terms(self) -> List[str]:
         return self._parse_blocklist(await self.config.block_tags_csv())
 
+    # -------------------------
+    # Lavalink / Audio track metadata access (best-effort)
+    # -------------------------
     def _current_track_text_from_audio(self, guild: discord.Guild) -> str:
         """
         Best-effort: prefer Red Audio's lavalink player metadata.
@@ -196,10 +204,9 @@ class UnifiedAudioRadio(commands.Cog):
 
         # Preferred: Red Audio lavalink player
         try:
-            # Red's bundled Audio cog exposes lavalink here in most modern versions.
-            from redbot.cogs.audio import lavalink  # type: ignore
+            from redbot.cogs.audio import lavalink as red_lavalink  # type: ignore
 
-            player = lavalink.get_player(guild.id)
+            player = red_lavalink.get_player(guild.id)
             cur = (
                 getattr(player, "current", None)
                 or getattr(player, "current_track", None)
@@ -234,6 +241,117 @@ class UnifiedAudioRadio(commands.Cog):
 
         return " ".join(parts).strip()
 
+    def _track_start_eventish(self, event: Any) -> bool:
+        """
+        Compatibility shim across lavalink.py / Red Audio wrapper versions.
+        Returns True if this looks like a 'track start' event.
+        """
+        if event is None:
+            return False
+        # Newer lavalink.py: event classes like TrackStartEvent
+        name = type(event).__name__.lower()
+        if "trackstart" in name or ("track" in name and "start" in name):
+            return True
+        # Some versions provide enum-like 'type' or 'event_type'
+        for attr in ("type", "event_type", "name"):
+            v = getattr(event, attr, None)
+            if isinstance(v, str) and "track" in v.lower() and "start" in v.lower():
+                return True
+        return False
+
+    def _ll_listener(self, player: Any, event: Any, *args: Any, **kwargs: Any) -> None:
+        """
+        Registered with Red Audio lavalink wrapper. Must be sync.
+        We schedule the async handler to avoid blocking the event loop chain.
+        """
+        try:
+            self.bot.loop.create_task(self._handle_lavalink_event(player, event))
+        except Exception:
+            pass
+
+    async def _handle_lavalink_event(self, player: Any, event: Any) -> None:
+        """
+        Authoritative YouTube/direct-link filter:
+        when a track actually starts, inspect resolved metadata and stop if blocked.
+        """
+        try:
+            if not self._track_start_eventish(event):
+                return
+
+            if not await self.config.bound():
+                return
+            if await self.config.panic_locked() or await self.config.suspended():
+                return
+
+            allowed_guild_id = await self.config.allowed_guild_id()
+            if not allowed_guild_id:
+                return
+
+            # player.guild_id is typical; some wrappers use player.guild or id
+            pgid = getattr(player, "guild_id", None) or getattr(player, "guild", None) or getattr(player, "gid", None)
+            try:
+                pgid_int = int(pgid)
+            except Exception:
+                return
+
+            if int(allowed_guild_id) != pgid_int:
+                return
+
+            guild = self.bot.get_guild(pgid_int)
+            if not guild:
+                return
+
+            # Only enforce for YouTube/audio playback flows, not arbitrary lavalink usage.
+            # (If you want to enforce ALWAYS, remove this guard.)
+            if not await self.config.audio_intent_active():
+                return
+
+            blocked = await self._blocked_terms()
+            if not blocked:
+                return
+
+            # Resolved track metadata
+            cur = getattr(player, "current", None) or getattr(player, "current_track", None) or getattr(player, "track", None)
+            if not cur:
+                return
+
+            title = getattr(cur, "title", "") or ""
+            author = getattr(cur, "author", "") or ""
+            uri = getattr(cur, "uri", "") or getattr(cur, "url", "") or ""
+            ident = getattr(cur, "identifier", "") or ""
+
+            blob = f"{title} {author} {uri} {ident}".strip()
+            if not blob:
+                return
+
+            if self._text_matches_blocklist(blob, blocked):
+                # Stop immediately
+                try:
+                    from redbot.cogs.audio import lavalink as red_lavalink  # type: ignore
+
+                    p2 = red_lavalink.get_player(guild.id)
+                    await p2.stop()
+                except Exception:
+                    # Fallback: disconnect if stop is unavailable
+                    try:
+                        await self._vc_disconnect(guild.voice_client)
+                    except Exception:
+                        pass
+
+                await self._clear_radio_state()
+                await self._clear_audio_intent()
+                await self._set_presence(None)
+
+                await self._audit_security(guild, "Blocked track (lavalink TRACK_START filter)")
+                await self._notify_control(
+                    guild,
+                    "🚫 Blocked Track Stopped",
+                    f"Blocked term detected in resolved track metadata:\n`{(blob[:200] + '…') if len(blob) > 200 else blob}`",
+                    discord.Color.orange(),
+                )
+        except Exception:
+            log.exception("Lavalink filter handler error")
+
     # -------------------------
     # Red lifecycle
     # -------------------------
@@ -248,10 +366,31 @@ class UnifiedAudioRadio(commands.Cog):
         if self._reassure_task is None or self._reassure_task.done():
             self._reassure_task = self.bot.loop.create_task(self._periodic_reassurance_loop())
 
+        # Register Lavalink listener (authoritative YouTube/direct-link filtering)
+        if not self._ll_registered:
+            try:
+                from redbot.cogs.audio import lavalink as red_lavalink  # type: ignore
+
+                red_lavalink.register_event_listener(self._ll_listener)
+                self._ll_registered = True
+            except Exception:
+                # If Audio isn't loaded yet, this may fail; watchdog + pre-play filters still work.
+                log.exception("Failed to register lavalink event listener")
+
     def cog_unload(self):
         for t in (self._watchdog_task, self._reassure_task):
             if t and not t.done():
                 t.cancel()
+
+        if self._ll_registered:
+            try:
+                from redbot.cogs.audio import lavalink as red_lavalink  # type: ignore
+
+                red_lavalink.unregister_event_listener(self._ll_listener)
+            except Exception:
+                pass
+            self._ll_registered = False
+
         if self.http and not self.http.closed:
             self.bot.loop.create_task(self._close_http())
 
@@ -675,7 +814,7 @@ class UnifiedAudioRadio(commands.Cog):
         return True
 
     # -------------------------
-    # Audio compatibility tripwire + DJ start/stop detection
+    # Audio compatibility tripwire + DJ start/stop detection + PRE-PLAY FILTER
     # -------------------------
     async def _audio_cmd_is_allowed(self, ctx: commands.Context) -> bool:
         if not ctx.guild:
@@ -725,7 +864,7 @@ class UnifiedAudioRadio(commands.Cog):
             if name in self.AUDIO_SUMMON_ALIASES and time.monotonic() <= self._allow_summon_until:
                 return
 
-            # Allowed inside perimeter: keep state consistent + DJ notifications + FILTERS.
+            # Allowed inside perimeter: keep state consistent + DJ notifications + PRE-PLAY FILTERS.
             if allowed:
                 # PLAY: detect YouTube-ish start
                 if name in self.AUDIO_PLAY_ALIASES:
@@ -740,7 +879,7 @@ class UnifiedAudioRadio(commands.Cog):
                         if blocked and self._text_matches_blocklist(yt_query, blocked):
                             await self._clear_audio_intent()
                             await self._set_presence(None)
-                            await ctx.send("🚫 Blocked by safety filter (matched blocked terms).")
+                            await ctx.send("🚫 Blocked by safety filter (matched blocked terms in the request).")
                             return
 
                         # Save last station if radio was active
@@ -796,7 +935,7 @@ class UnifiedAudioRadio(commands.Cog):
             pass
 
     # -------------------------
-    # Watchdog
+    # Watchdog (includes POST-RESOLVE FALLBACK FILTER)
     # -------------------------
     async def _watchdog_loop(self):
         await self.bot.wait_until_ready()
@@ -829,16 +968,23 @@ class UnifiedAudioRadio(commands.Cog):
                     await self._autopanic(guild, "Watchdog: media active but bot is not home")
                     continue
 
-                # POST-RESOLVE FILTER (best-effort):
-                # If Audio is playing a track whose metadata contains blocked terms, stop it.
+                # POST-RESOLVE FILTER (fallback):
+                # If Audio is playing and we can see track metadata here, block it.
                 blocked = await self._blocked_terms()
                 if blocked:
                     blob = self._current_track_text_from_audio(guild)
                     if blob and self._text_matches_blocklist(blob, blocked):
                         try:
-                            await self._vc_disconnect(guild.voice_client)
+                            # Prefer stop if possible; fallback to disconnect.
+                            from redbot.cogs.audio import lavalink as red_lavalink  # type: ignore
+
+                            p = red_lavalink.get_player(guild.id)
+                            await p.stop()
                         except Exception:
-                            pass
+                            try:
+                                await self._vc_disconnect(guild.voice_client)
+                            except Exception:
+                                pass
 
                         await self._clear_radio_state()
                         await self._clear_audio_intent()
@@ -1657,7 +1803,9 @@ class UnifiedAudioRadio(commands.Cog):
         await self._audio_stop(ctx)
         await self._clear_radio_state()
         await self._set_presence(None)
-        await ctx.send(embed=discord.Embed(title="⏹️ Stopped", description="Radio stream stopped.", color=discord.Color.red()))
+        await ctx.send(
+            embed=discord.Embed(title="⏹️ Stopped", description="Radio stream stopped.", color=discord.Color.red())
+        )
 
     # -------------------------
     # DJ command: request radio back (notify Grey Hair Asuka)
