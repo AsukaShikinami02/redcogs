@@ -82,9 +82,14 @@ class UnifiedAudioRadio(commands.Cog):
     - DJ can request radio back via g!djradio (notifies Grey Hair Asuka)
 
     IMPORTANT BEHAVIOR (per your request):
-    - rrrestore = RADIO restore ONLY (last saved station)
+    - rrrestore = RADIO restore ONLY (last saved station) AND force-switch (stop YouTube first)
     - rrunlock = clears panic + homes + resumes playback from BOTH sources (whichever was active at panic),
                 with fallback attempts (YouTube first if we have it, then radio).
+
+    NEW (per your request):
+    - block_tags_csv is now enforced for BOTH:
+        * Radio: station.tags + station.name (already)
+        * YouTube: (a) pre-play filter on typed query/link, AND (b) watchdog post-resolve filter on actual track metadata
     """
 
     AUDIO_SUMMON_ALIASES: Set[str] = {"summon", "join", "connect"}
@@ -134,7 +139,7 @@ class UnifiedAudioRadio(commands.Cog):
             panic_resume_station_url=None,
             panic_resume_youtube_query=None,
 
-            # filters
+            # filters (now applies to BOTH radio and youtube)
             min_bitrate_kbps=64,
             block_tags_csv="phonk,earrape,nsfw",
 
@@ -166,6 +171,68 @@ class UnifiedAudioRadio(commands.Cog):
 
         self._last_reassure_in_vc_ts: float = 0.0
         self._last_reassure_out_vc_ts: float = 0.0
+
+    # -------------------------
+    # Blocklist helpers (Radio + YouTube)
+    # -------------------------
+    def _parse_blocklist(self, csv: str) -> List[str]:
+        return [t.strip().lower() for t in (csv or "").split(",") if t.strip()]
+
+    def _text_matches_blocklist(self, text: str, blocked: List[str]) -> bool:
+        blob = (text or "").lower()
+        return any(b in blob for b in blocked if b)
+
+    async def _blocked_terms(self) -> List[str]:
+        return self._parse_blocklist(await self.config.block_tags_csv())
+
+    def _current_track_text_from_audio(self, guild: discord.Guild) -> str:
+        """
+        Best-effort: prefer Red Audio's lavalink player metadata.
+        Falls back to probing guild.voice_client if lavalink isn't available.
+
+        Returns a blob containing title/author/uri/etc, or "" if nothing accessible.
+        """
+        parts: List[str] = []
+
+        # Preferred: Red Audio lavalink player
+        try:
+            # Red's bundled Audio cog exposes lavalink here in most modern versions.
+            from redbot.cogs.audio import lavalink  # type: ignore
+
+            player = lavalink.get_player(guild.id)
+            cur = (
+                getattr(player, "current", None)
+                or getattr(player, "current_track", None)
+                or getattr(player, "track", None)
+            )
+            if cur:
+                for attr in ("title", "author", "uri", "identifier", "track_identifier", "source", "url"):
+                    v = getattr(cur, attr, None)
+                    if v:
+                        parts.append(str(v))
+                if isinstance(cur, dict):
+                    for k in ("title", "author", "uri", "identifier", "source", "url"):
+                        if cur.get(k):
+                            parts.append(str(cur.get(k)))
+        except Exception:
+            pass
+
+        # Fallback: probe voice_client
+        vc = guild.voice_client
+        if vc:
+            for attr in ("current", "current_track", "track", "now_playing", "playing"):
+                obj = getattr(vc, attr, None)
+                if obj:
+                    for k in ("title", "author", "uri", "identifier", "source", "url"):
+                        v = getattr(obj, k, None)
+                        if v:
+                            parts.append(str(v))
+                    if isinstance(obj, dict):
+                        for k in ("title", "author", "uri", "identifier", "source", "url"):
+                            if obj.get(k):
+                                parts.append(str(obj.get(k)))
+
+        return " ".join(parts).strip()
 
     # -------------------------
     # Red lifecycle
@@ -658,12 +725,24 @@ class UnifiedAudioRadio(commands.Cog):
             if name in self.AUDIO_SUMMON_ALIASES and time.monotonic() <= self._allow_summon_until:
                 return
 
-            # Allowed inside perimeter: keep state consistent + DJ notifications.
+            # Allowed inside perimeter: keep state consistent + DJ notifications + FILTERS.
             if allowed:
                 # PLAY: detect YouTube-ish start
                 if name in self.AUDIO_PLAY_ALIASES:
                     content = (ctx.message.content or "")
                     if _looks_like_youtube(content):
+                        # Extract user input (query/link)
+                        yt_query = self._extract_play_query(ctx) or content
+                        yt_query = str(yt_query)[:4000]
+
+                        # PRE-PLAY FILTER: block if typed query/link matches blocked terms
+                        blocked = await self._blocked_terms()
+                        if blocked and self._text_matches_blocklist(yt_query, blocked):
+                            await self._clear_audio_intent()
+                            await self._set_presence(None)
+                            await ctx.send("🚫 Blocked by safety filter (matched blocked terms).")
+                            return
+
                         # Save last station if radio was active
                         if await self._radio_active():
                             await self.config.last_station_name.set(await self.config.station_name())
@@ -673,9 +752,7 @@ class UnifiedAudioRadio(commands.Cog):
 
                         await self.config.audio_intent_active.set(True)
                         await self.config.audio_intent_started_monotonic.set(float(time.monotonic()))
-
-                        yt_query = self._extract_play_query(ctx) or content
-                        await self.config.last_youtube_query.set(str(yt_query)[:4000])
+                        await self.config.last_youtube_query.set(yt_query)
 
                         await self._dj_youtube_started(ctx.guild)
 
@@ -751,6 +828,30 @@ class UnifiedAudioRadio(commands.Cog):
                 if not await self._bot_is_home(guild):
                     await self._autopanic(guild, "Watchdog: media active but bot is not home")
                     continue
+
+                # POST-RESOLVE FILTER (best-effort):
+                # If Audio is playing a track whose metadata contains blocked terms, stop it.
+                blocked = await self._blocked_terms()
+                if blocked:
+                    blob = self._current_track_text_from_audio(guild)
+                    if blob and self._text_matches_blocklist(blob, blocked):
+                        try:
+                            await self._vc_disconnect(guild.voice_client)
+                        except Exception:
+                            pass
+
+                        await self._clear_radio_state()
+                        await self._clear_audio_intent()
+                        await self._set_presence(None)
+
+                        await self._audit_security(guild, "Watchdog: blocked term detected in resolved track metadata")
+                        await self._notify_control(
+                            guild,
+                            "🚫 Blocked Track Stopped",
+                            f"Blocked term detected in current track metadata:\n`{(blob[:200] + '…') if len(blob) > 200 else blob}`",
+                            discord.Color.orange(),
+                        )
+                        continue
 
             except asyncio.CancelledError:
                 break
@@ -1031,7 +1132,9 @@ class UnifiedAudioRadio(commands.Cog):
             inline=False,
         )
 
-        embed.set_footer(text="Commands: rrstatus | rrunlock [home|resume|full] | rrpanic | rrsuspend | rrresume | rrhard | rrrestore")
+        embed.set_footer(
+            text="Commands: rrstatus | rrunlock [home|resume|full] | rrpanic | rrsuspend | rrresume | rrhard | rrrestore"
+        )
         await ctx.send(embed=embed)
 
     @commands.is_owner()
@@ -1374,8 +1477,7 @@ class UnifiedAudioRadio(commands.Cog):
             return
 
         min_bitrate = int(await self.config.min_bitrate_kbps() or 0)
-        blocked_csv = (await self.config.block_tags_csv() or "").lower()
-        blocked_tags = [t.strip() for t in blocked_csv.split(",") if t.strip()]
+        blocked_tags = await self._blocked_terms()
 
         stations: List[Station] = []
         for raw in data[:SEARCH_LIMIT]:
@@ -1491,7 +1593,6 @@ class UnifiedAudioRadio(commands.Cog):
         embed.set_footer(text="No track titles. Station name only.")
         await ctx.send(embed=embed)
 
-       # ✅ rrrestore = RADIO ONLY + FORCE SWITCH (stop YouTube first)
     @commands.is_owner()
     @commands.command()
     async def rrrestore(self, ctx: commands.Context):
@@ -1516,7 +1617,7 @@ class UnifiedAudioRadio(commands.Cog):
             await ctx.send("No saved station to restore yet. Use `playstation` first.")
             return
 
-        # --- FORCE SWITCH: stop whatever Audio is currently doing (YouTube/queue/etc.)
+        # FORCE SWITCH: stop whatever Audio is currently doing (YouTube/queue/etc.)
         try:
             await self._audio_stop(ctx)
         except Exception:
@@ -1547,7 +1648,6 @@ class UnifiedAudioRadio(commands.Cog):
         )
         embed.set_footer(text="Grey Hair Asuka protocol: force-switch to radio.")
         await ctx.send(embed=embed)
-
 
     @commands.is_owner()
     @commands.command()
