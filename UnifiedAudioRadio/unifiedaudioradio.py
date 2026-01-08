@@ -18,7 +18,7 @@ SEARCH_LIMIT = 50
 PAGE_SIZE = 10
 REACTION_TIMEOUT = 35.0
 
-WATCHDOG_INTERVAL = 2.0
+WATCHDOG_INTERVAL = 8.0
 SUMMON_GRACE_SECONDS = 10.0
 HOME_GRACE_SECONDS = 15.0
 
@@ -81,17 +81,11 @@ class UnifiedAudioRadio(commands.Cog):
     - Notify DJ when YouTube starts / stops
     - DJ can request radio back via g!djradio (notifies Grey Hair Asuka)
 
-    IMPORTANT BEHAVIOR (per your request):
+    IMPORTANT BEHAVIOR (guard rails):
     - rrrestore = RADIO restore ONLY (last saved station) AND force-switch (stop YouTube first)
-    - rrunlock = clears panic + homes + resumes playback from BOTH sources (whichever was active at panic),
-                with fallback attempts (YouTube first if we have it, then radio).
-
-    FILTERS (per your request):
-    - block_tags_csv is enforced for BOTH:
-        * Radio: station.tags + station.name (radio-browser search filter)
-        * YouTube: (a) pre-play filter on typed query/link, AND
-                  (b) lavalink TRACK_START filter on resolved track metadata (direct-link safe),
-                  (c) watchdog post-resolve best-effort fallback.
+    - rrunlock default is SAFE: clears panic + homes ONLY (NO auto-resume)
+      * rrunlock resume / full = clears panic + homes + resumes from panic snapshot/memory
+      * rrunlock radio = clears panic + homes + restores last saved radio station (safe fallback)
     """
 
     AUDIO_SUMMON_ALIASES: Set[str] = {"summon", "join", "connect"}
@@ -141,7 +135,7 @@ class UnifiedAudioRadio(commands.Cog):
             panic_resume_station_url=None,
             panic_resume_youtube_query=None,
 
-            # filters (applies to BOTH radio and youtube)
+            # filters (applies to BOTH radio and youtube where possible)
             min_bitrate_kbps=64,
             block_tags_csv="phonk,earrape,nsfw",
 
@@ -174,7 +168,7 @@ class UnifiedAudioRadio(commands.Cog):
         self._last_reassure_in_vc_ts: float = 0.0
         self._last_reassure_out_vc_ts: float = 0.0
 
-        # Lavalink event hook registration state
+        # Lavalink event hook registration state (best-effort)
         self._ll_registered: bool = False
 
     # -------------------------
@@ -202,7 +196,6 @@ class UnifiedAudioRadio(commands.Cog):
         """
         parts: List[str] = []
 
-        # Preferred: Red Audio lavalink player
         try:
             from redbot.cogs.audio import lavalink as red_lavalink  # type: ignore
 
@@ -224,7 +217,6 @@ class UnifiedAudioRadio(commands.Cog):
         except Exception:
             pass
 
-        # Fallback: probe voice_client
         vc = guild.voice_client
         if vc:
             for attr in ("current", "current_track", "track", "now_playing", "playing"):
@@ -242,17 +234,11 @@ class UnifiedAudioRadio(commands.Cog):
         return " ".join(parts).strip()
 
     def _track_start_eventish(self, event: Any) -> bool:
-        """
-        Compatibility shim across lavalink.py / Red Audio wrapper versions.
-        Returns True if this looks like a 'track start' event.
-        """
         if event is None:
             return False
-        # Newer lavalink.py: event classes like TrackStartEvent
         name = type(event).__name__.lower()
         if "trackstart" in name or ("track" in name and "start" in name):
             return True
-        # Some versions provide enum-like 'type' or 'event_type'
         for attr in ("type", "event_type", "name"):
             v = getattr(event, attr, None)
             if isinstance(v, str) and "track" in v.lower() and "start" in v.lower():
@@ -260,10 +246,6 @@ class UnifiedAudioRadio(commands.Cog):
         return False
 
     def _ll_listener(self, player: Any, event: Any, *args: Any, **kwargs: Any) -> None:
-        """
-        Registered with Red Audio lavalink wrapper. Must be sync.
-        We schedule the async handler to avoid blocking the event loop chain.
-        """
         try:
             self.bot.loop.create_task(self._handle_lavalink_event(player, event))
         except Exception:
@@ -271,13 +253,13 @@ class UnifiedAudioRadio(commands.Cog):
 
     async def _handle_lavalink_event(self, player: Any, event: Any) -> None:
         """
-        Authoritative YouTube/direct-link filter:
-        when a track actually starts, inspect resolved metadata and stop if blocked.
+        Best-effort YouTube/direct-link filter:
+        when a track starts, inspect resolved metadata and stop if blocked.
+        (Manual rrpanic remains your primary safety override.)
         """
         try:
             if not self._track_start_eventish(event):
                 return
-
             if not await self.config.bound():
                 return
             if await self.config.panic_locked() or await self.config.suspended():
@@ -287,7 +269,6 @@ class UnifiedAudioRadio(commands.Cog):
             if not allowed_guild_id:
                 return
 
-            # player.guild_id is typical; some wrappers use player.guild or id
             pgid = getattr(player, "guild_id", None) or getattr(player, "guild", None) or getattr(player, "gid", None)
             try:
                 pgid_int = int(pgid)
@@ -301,8 +282,6 @@ class UnifiedAudioRadio(commands.Cog):
             if not guild:
                 return
 
-            # Only enforce for YouTube/audio playback flows, not arbitrary lavalink usage.
-            # (If you want to enforce ALWAYS, remove this guard.)
             if not await self.config.audio_intent_active():
                 return
 
@@ -310,7 +289,6 @@ class UnifiedAudioRadio(commands.Cog):
             if not blocked:
                 return
 
-            # Resolved track metadata
             cur = getattr(player, "current", None) or getattr(player, "current_track", None) or getattr(player, "track", None)
             if not cur:
                 return
@@ -325,14 +303,12 @@ class UnifiedAudioRadio(commands.Cog):
                 return
 
             if self._text_matches_blocklist(blob, blocked):
-                # Stop immediately
+                # Stop immediately (non-panic). Use rrpanic manually if you hear something unsafe.
                 try:
                     from redbot.cogs.audio import lavalink as red_lavalink  # type: ignore
-
                     p2 = red_lavalink.get_player(guild.id)
                     await p2.stop()
                 except Exception:
-                    # Fallback: disconnect if stop is unavailable
                     try:
                         await self._vc_disconnect(guild.voice_client)
                     except Exception:
@@ -366,15 +342,12 @@ class UnifiedAudioRadio(commands.Cog):
         if self._reassure_task is None or self._reassure_task.done():
             self._reassure_task = self.bot.loop.create_task(self._periodic_reassurance_loop())
 
-        # Register Lavalink listener (authoritative YouTube/direct-link filtering)
         if not self._ll_registered:
             try:
                 from redbot.cogs.audio import lavalink as red_lavalink  # type: ignore
-
                 red_lavalink.register_event_listener(self._ll_listener)
                 self._ll_registered = True
             except Exception:
-                # If Audio isn't loaded yet, this may fail; watchdog + pre-play filters still work.
                 log.exception("Failed to register lavalink event listener")
 
     def cog_unload(self):
@@ -385,7 +358,6 @@ class UnifiedAudioRadio(commands.Cog):
         if self._ll_registered:
             try:
                 from redbot.cogs.audio import lavalink as red_lavalink  # type: ignore
-
                 red_lavalink.unregister_event_listener(self._ll_listener)
             except Exception:
                 pass
@@ -407,7 +379,7 @@ class UnifiedAudioRadio(commands.Cog):
         return self.http  # type: ignore[return-value]
 
     # -------------------------
-    # Voice abstraction (discord.py VoiceClient vs Red Audio Lavalink Player)
+    # Voice abstraction
     # -------------------------
     def _vc_connected(self, vc) -> bool:
         if vc is None:
@@ -500,7 +472,6 @@ class UnifiedAudioRadio(commands.Cog):
     # Restore / resume memory helpers
     # -------------------------
     def _extract_play_query(self, ctx: commands.Context) -> Optional[str]:
-        """Best-effort extraction of what was typed after the command (prefix commands)."""
         try:
             content = (ctx.message.content or "").strip()
             if not content:
@@ -513,13 +484,6 @@ class UnifiedAudioRadio(commands.Cog):
             return None
 
     async def _snapshot_for_panic(self, guild: discord.Guild) -> None:
-        """
-        Capture what was active at the moment we engage panic so rrunlock can resume it.
-        Preference:
-          1) If radio_active -> snapshot radio
-          2) Else if audio intent active OR player is playing AND we have a last_youtube_query -> snapshot youtube
-          3) Else -> clear snapshot
-        """
         try:
             if await self._radio_active():
                 sn = await self.config.station_name()
@@ -618,7 +582,6 @@ class UnifiedAudioRadio(commands.Cog):
             if await self.config.panic_locked():
                 return
 
-            # snapshot active media for rrunlock to resume
             await self._snapshot_for_panic(guild)
 
             await self.config.panic_locked.set(True)
@@ -637,7 +600,9 @@ class UnifiedAudioRadio(commands.Cog):
             await self._notify_control(
                 guild,
                 "🛑 Panic Engaged",
-                f"{reason}\n\nUse `rrunlock` in the control channel (while you’re in the locked VC).",
+                f"{reason}\n\nSafe recovery:\n"
+                f"1) `rrunlock` (home-only)\n"
+                f"2) optionally `rrunlock radio` OR `rrunlock resume`",
                 discord.Color.red(),
             )
 
@@ -703,7 +668,7 @@ class UnifiedAudioRadio(commands.Cog):
         await self._send_to_dj(guild, embed)
 
     # -------------------------
-    # Cog gating (this cog only)
+    # Cog gating
     # -------------------------
     async def cog_check(self, ctx: commands.Context) -> bool:
         if ctx.guild is None:
@@ -711,7 +676,6 @@ class UnifiedAudioRadio(commands.Cog):
 
         cmd = (ctx.command.qualified_name if ctx.command else "").lower()
 
-        # DJ-only command bypass
         if cmd == "djradio":
             allowed_guild_id = await self.config.allowed_guild_id()
             dj_user_id = await self.config.dj_user_id()
@@ -719,7 +683,6 @@ class UnifiedAudioRadio(commands.Cog):
                 return False
             return bool(dj_user_id and ctx.author.id == int(dj_user_id))
 
-        # Owner only for everything else
         try:
             is_owner = await self.bot.is_owner(ctx.author)  # type: ignore[arg-type]
         except Exception:
@@ -814,7 +777,7 @@ class UnifiedAudioRadio(commands.Cog):
         return True
 
     # -------------------------
-    # Audio compatibility tripwire + DJ start/stop detection + PRE-PLAY FILTER
+    # Audio tripwire + DJ start/stop detection + PRE-PLAY FILTER
     # -------------------------
     async def _audio_cmd_is_allowed(self, ctx: commands.Context) -> bool:
         if not ctx.guild:
@@ -860,21 +823,16 @@ class UnifiedAudioRadio(commands.Cog):
             name = (ctx.command.name or "").lower()
             allowed = await self._audio_cmd_is_allowed(ctx)
 
-            # If rrhome just authorized summon, ignore.
             if name in self.AUDIO_SUMMON_ALIASES and time.monotonic() <= self._allow_summon_until:
                 return
 
-            # Allowed inside perimeter: keep state consistent + DJ notifications + PRE-PLAY FILTERS.
             if allowed:
-                # PLAY: detect YouTube-ish start
                 if name in self.AUDIO_PLAY_ALIASES:
                     content = (ctx.message.content or "")
                     if _looks_like_youtube(content):
-                        # Extract user input (query/link)
                         yt_query = self._extract_play_query(ctx) or content
                         yt_query = str(yt_query)[:4000]
 
-                        # PRE-PLAY FILTER: block if typed query/link matches blocked terms
                         blocked = await self._blocked_terms()
                         if blocked and self._text_matches_blocklist(yt_query, blocked):
                             await self._clear_audio_intent()
@@ -882,7 +840,6 @@ class UnifiedAudioRadio(commands.Cog):
                             await ctx.send("🚫 Blocked by safety filter (matched blocked terms in the request).")
                             return
 
-                        # Save last station if radio was active
                         if await self._radio_active():
                             await self.config.last_station_name.set(await self.config.station_name())
                             await self.config.last_station_stream_url.set(await self.config.stream_url())
@@ -895,14 +852,12 @@ class UnifiedAudioRadio(commands.Cog):
 
                         await self._dj_youtube_started(ctx.guild)
 
-                # STOP: stop notifications + clear states
                 if name in self.AUDIO_STOP_ALIASES:
                     await self._clear_radio_state()
                     await self._clear_audio_intent()
                     await self._set_presence(None)
                     await self._dj_youtube_stopped(ctx.guild)
 
-                # DISCONNECT: clear + grace windows
                 if name in self.AUDIO_DISCONNECT_ALIASES:
                     await self._clear_radio_state()
                     await self._clear_audio_intent()
@@ -914,7 +869,6 @@ class UnifiedAudioRadio(commands.Cog):
 
                 return
 
-            # Not allowed: only react if something is active.
             if not await self._any_active(ctx.guild):
                 return
 
@@ -960,24 +914,19 @@ class UnifiedAudioRadio(commands.Cog):
                 if not guild:
                     continue
 
-                active = await self._any_active(guild)
-                if not active:
+                if not await self._any_active(guild):
                     continue
 
                 if not await self._bot_is_home(guild):
                     await self._autopanic(guild, "Watchdog: media active but bot is not home")
                     continue
 
-                # POST-RESOLVE FILTER (fallback):
-                # If Audio is playing and we can see track metadata here, block it.
                 blocked = await self._blocked_terms()
                 if blocked:
                     blob = self._current_track_text_from_audio(guild)
                     if blob and self._text_matches_blocklist(blob, blocked):
                         try:
-                            # Prefer stop if possible; fallback to disconnect.
                             from redbot.cogs.audio import lavalink as red_lavalink  # type: ignore
-
                             p = red_lavalink.get_player(guild.id)
                             await p.stop()
                         except Exception:
@@ -1155,7 +1104,6 @@ class UnifiedAudioRadio(commands.Cog):
     @commands.is_owner()
     @commands.command()
     async def rrstatus(self, ctx: commands.Context):
-        """Show current safety state (panic/suspended), binding, channels, and media state."""
         if ctx.guild is None:
             return
 
@@ -1261,9 +1209,7 @@ class UnifiedAudioRadio(commands.Cog):
 
         embed.add_field(
             name="YouTube Memory",
-            value=(
-                f"**Last YouTube Query:** {(last_yt[:200] + '…') if (last_yt and len(last_yt) > 200) else (last_yt or '—')}"
-            ),
+            value=f"**Last YouTube Query:** {((last_yt[:200] + '…') if (last_yt and len(last_yt) > 200) else (last_yt or '—'))}",
             inline=False,
         )
 
@@ -1273,20 +1219,19 @@ class UnifiedAudioRadio(commands.Cog):
                 f"**Kind:** {pr_kind or '—'}\n"
                 f"**Station:** {pr_station or '—'}\n"
                 f"**Station URL:** {pr_station_url or '—'}\n"
-                f"**YT Query:** {(pr_yt[:200] + '…') if (pr_yt and len(pr_yt) > 200) else (pr_yt or '—')}"
+                f"**YT Query:** {((pr_yt[:200] + '…') if (pr_yt and len(pr_yt) > 200) else (pr_yt or '—'))}"
             ),
             inline=False,
         )
 
         embed.set_footer(
-            text="Commands: rrstatus | rrunlock [home|resume|full] | rrpanic | rrsuspend | rrresume | rrhard | rrrestore"
+            text="Commands: rrstatus | rrpanic | rrunlock [home|resume|full|radio] | rrrestore | rrsuspend | rrresume | rrhard"
         )
         await ctx.send(embed=embed)
 
     @commands.is_owner()
     @commands.command()
     async def rrpanic(self, ctx: commands.Context, *, reason: str = "Manual panic engaged"):
-        """Manually engage panic: disconnect, clear state, lock commands."""
         if ctx.guild is None:
             return
         if not await self.config.bound():
@@ -1311,7 +1256,9 @@ class UnifiedAudioRadio(commands.Cog):
         await self._notify_control(
             ctx.guild,
             "🛑 Panic Engaged (Manual)",
-            f"{reason}\n\nUse `rrunlock` in the control channel (while you’re in the locked VC).",
+            f"{reason}\n\nSafe recovery:\n"
+            f"1) `rrunlock` (home-only)\n"
+            f"2) optionally `rrunlock radio` OR `rrunlock resume`",
             discord.Color.red(),
         )
         await ctx.send("Panic engaged.")
@@ -1319,7 +1266,6 @@ class UnifiedAudioRadio(commands.Cog):
     @commands.is_owner()
     @commands.command()
     async def rrsuspend(self, ctx: commands.Context, *, reason: str = "Manual suspend"):
-        """Soft-stop: blocks playback actions until rrresume (does not lock like panic)."""
         if ctx.guild is None:
             return
         if not await self.config.bound():
@@ -1349,7 +1295,6 @@ class UnifiedAudioRadio(commands.Cog):
     @commands.is_owner()
     @commands.command()
     async def rrresume(self, ctx: commands.Context):
-        """Resume after suspension (requires owner in locked VC)."""
         if ctx.guild is None:
             return
         if not await self.config.bound():
@@ -1364,7 +1309,6 @@ class UnifiedAudioRadio(commands.Cog):
     @commands.is_owner()
     @commands.command()
     async def rrhard(self, ctx: commands.Context, mode: Optional[str] = None):
-        """Toggle hard mode: hard=panic, soft=suspend."""
         if mode is None:
             cur = bool(await self.config.hard_mode())
             await ctx.send(f"Hard mode is currently: **{cur}**. Use `rrhard on` or `rrhard off`.")
@@ -1381,22 +1325,13 @@ class UnifiedAudioRadio(commands.Cog):
             await ctx.send("Use `rrhard on` or `rrhard off`.")
 
     async def _attempt_resume_after_unlock(self, ctx: commands.Context) -> Tuple[bool, str]:
-        """
-        Resume playback after unlock+home.
-        1) Try panic snapshot kind first.
-        2) If that fails, try YouTube (last_youtube_query).
-        3) If that fails, try Radio (last_station_*).
-        Returns (ok, message).
-        """
         if not ctx.guild:
             return False, "No guild."
 
-        # Always clear live state before attempting a resume
         await self._clear_radio_state()
         await self._clear_audio_intent()
         await self._set_presence(None)
 
-        # ---- 1) panic snapshot ----
         kind = (await self.config.panic_resume_kind()) or ""
         if kind == "youtube":
             q = await self.config.panic_resume_youtube_query()
@@ -1418,7 +1353,6 @@ class UnifiedAudioRadio(commands.Cog):
                     await self._set_presence(f"📻 {n}")
                     return True, "Resumed from panic snapshot: Radio."
 
-        # ---- 2) fallback YouTube ----
         q2 = await self.config.last_youtube_query()
         if q2:
             await self.config.audio_intent_active.set(True)
@@ -1428,7 +1362,6 @@ class UnifiedAudioRadio(commands.Cog):
                 await self._set_presence("▶️ YouTube")
                 return True, "Resumed from memory: YouTube."
 
-        # ---- 3) fallback Radio ----
         n2 = await self.config.last_station_name()
         u2 = await self.config.last_station_stream_url()
         if n2 and u2:
@@ -1441,37 +1374,53 @@ class UnifiedAudioRadio(commands.Cog):
 
         return False, "No resume targets found."
 
+    async def _restore_radio_after_unlock(self, ctx: commands.Context) -> Tuple[bool, str]:
+        last_name = await self.config.last_station_name()
+        last_url = await self.config.last_station_stream_url()
+        if not last_name or not last_url:
+            return False, "No saved station to restore."
+
+        try:
+            await self._audio_stop(ctx)
+        except Exception:
+            pass
+
+        await self._clear_audio_intent()
+        await self._clear_radio_state()
+        await self._set_presence(None)
+
+        await self.config.stream_url.set(last_url)
+        await self.config.station_name.set(last_name)
+
+        ok = await self._audio_play(ctx, last_url)
+        if not ok:
+            return False, "Audio play failed for radio restore."
+
+        await self._set_presence(f"📻 {last_name}")
+        return True, f"Unlocked + homed + switched to radio: {last_name}"
+
     @commands.is_owner()
     @commands.command()
     async def rrunlock(self, ctx: commands.Context, mode: Optional[str] = None):
-        """
-        Recover from panic lock.
-
-        Modes:
-        - (none): clears panic + homes + resumes playback (default behavior you requested)
-        - home  : clears panic + homes ONLY (no resume)
-        - resume: clears panic + homes + resumes (same as default)
-        - full  : same as resume
-        """
         if ctx.guild is None:
             return
         if not await self.config.bound():
             await ctx.send("Not bound yet. Use `rrbind` first.")
             return
-
         if not await self._require_owner_in_allowed_vc(ctx):
             return
 
         m = (mode or "").strip().lower()
-        do_home = m in ("", "home", "resume", "full")
-        do_resume = m in ("", "resume", "full")
 
-        # clear panic lock
+        # SAFE DEFAULT: no resume unless explicitly requested
+        do_home = m in ("", "home", "resume", "full", "radio")
+        do_resume = m in ("resume", "full")
+        do_radio = m == "radio"
+
         await self.config.panic_locked.set(False)
         await self.config.autopanic_reason.set(None)
         await self._unsuspend()
 
-        # home first
         if do_home:
             now = time.monotonic()
             self._allow_summon_until = now + SUMMON_GRACE_SECONDS
@@ -1482,25 +1431,41 @@ class UnifiedAudioRadio(commands.Cog):
                 await ctx.send("Unlocked, but summon failed. Try `rrhome`.")
                 return
 
-        # resume after home
-        resume_msg = ""
+        # radio-only safe fallback
+        if do_radio:
+            ok, msg = await self._restore_radio_after_unlock(ctx)
+            result_line = f"✅ {msg}" if ok else f"⚠️ Unlock complete, but radio restore failed. ({msg})"
+            await ctx.send(result_line)
+            await self._clear_panic_snapshot()
+            await self._notify_control(
+                ctx.guild,
+                "✅ Panic Cleared",
+                f"Panic lock cleared by {ctx.author.mention}.\nHome: **YES**\nPlayback: **RADIO**\nResult: {result_line}",
+                discord.Color.green(),
+            )
+            return
+
+        # resume (explicit only)
         if do_resume:
-            ok, resume_msg = await self._attempt_resume_after_unlock(ctx)
-            if ok:
-                await ctx.send(f"✅ {resume_msg}")
-            else:
-                await ctx.send(f"⚠️ Unlock complete, but nothing resumed. ({resume_msg})")
+            ok, msg = await self._attempt_resume_after_unlock(ctx)
+            result_line = f"✅ {msg}" if ok else f"⚠️ Unlock complete, but nothing resumed. ({msg})"
+            await ctx.send(result_line)
+            await self._clear_panic_snapshot()
+            await self._notify_control(
+                ctx.guild,
+                "✅ Panic Cleared",
+                f"Panic lock cleared by {ctx.author.mention}.\nHome: **YES**\nPlayback: **RESUME**\nResult: {result_line}",
+                discord.Color.green(),
+            )
+            return
 
-        # once we’ve used it, clear snapshot so it doesn’t surprise you later
+        # default safe: no playback
+        await ctx.send("✅ Unlocked + homed. Playback is OFF by default. Use `rrunlock radio` or `rrunlock resume`.")
         await self._clear_panic_snapshot()
-
         await self._notify_control(
             ctx.guild,
             "✅ Panic Cleared",
-            f"Panic lock cleared by {ctx.author.mention}.\n"
-            f"Home: **{'YES' if do_home else 'NO'}**\n"
-            f"Resume: **{'YES' if do_resume else 'NO'}**"
-            + (f"\nResult: {resume_msg}" if resume_msg else ""),
+            f"Panic lock cleared by {ctx.author.mention}.\nHome: **YES**\nPlayback: **OFF**\nResult: Unlocked + homed (no playback).",
             discord.Color.green(),
         )
 
@@ -1715,11 +1680,9 @@ class UnifiedAudioRadio(commands.Cog):
 
         station = stations[index - 1]
 
-        # radio restore memory
         await self.config.last_station_name.set(station.name)
         await self.config.last_station_stream_url.set(station.stream_url)
 
-        # if we switch to radio, clear audio intent
         await self._clear_audio_intent()
 
         await self.config.stream_url.set(station.stream_url)
@@ -1742,10 +1705,6 @@ class UnifiedAudioRadio(commands.Cog):
     @commands.is_owner()
     @commands.command()
     async def rrrestore(self, ctx: commands.Context):
-        """
-        Restore the last saved radio station (radio-only),
-        and FORCE switch by stopping any current Audio playback (e.g., YouTube).
-        """
         if not await self._require_owner_in_allowed_vc(ctx):
             return
         if not await self._require_bot_home(ctx):
@@ -1754,7 +1713,7 @@ class UnifiedAudioRadio(commands.Cog):
             await ctx.send("Suspended. Use `rrresume` first.")
             return
         if await self.config.panic_locked():
-            await ctx.send("Panic lock is active. Use `rrunlock` (it will resume).")
+            await ctx.send("Panic lock is active. Use `rrunlock` (home-only) first.")
             return
 
         last_name = await self.config.last_station_name()
@@ -1763,18 +1722,15 @@ class UnifiedAudioRadio(commands.Cog):
             await ctx.send("No saved station to restore yet. Use `playstation` first.")
             return
 
-        # FORCE SWITCH: stop whatever Audio is currently doing (YouTube/queue/etc.)
         try:
             await self._audio_stop(ctx)
         except Exception:
             pass
 
-        # Clear all media state so watchdog / gating stays consistent
         await self._clear_audio_intent()
         await self._clear_radio_state()
         await self._set_presence(None)
 
-        # Set radio state and play it
         await self.config.stream_url.set(last_url)
         await self.config.station_name.set(last_name)
 
@@ -1808,7 +1764,7 @@ class UnifiedAudioRadio(commands.Cog):
         )
 
     # -------------------------
-    # DJ command: request radio back (notify Grey Hair Asuka)
+    # DJ command
     # -------------------------
     @commands.guild_only()
     @commands.command()
@@ -1822,7 +1778,7 @@ class UnifiedAudioRadio(commands.Cog):
 
         dj_user_id = await self.config.dj_user_id()
         if not dj_user_id or ctx.author.id != int(dj_user_id):
-            return  # silent fail by design
+            return
 
         control = await self._control_channel(ctx.guild)
         if not control:
