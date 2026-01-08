@@ -3,31 +3,41 @@ import logging
 import time
 import urllib.parse
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 import aiohttp
 import discord
 from redbot.core import Config, commands
 
-log = logging.getLogger("red.greyasuka.radio")
+log = logging.getLogger("red.greyasuka.unified_audio_radio")
 
 RB_API = "https://de2.api.radio-browser.info/json"
-USER_AGENT = "Red-DiscordBot/RedRadio (GreyHairAsuka APPROVED++)"
+USER_AGENT = "Red-DiscordBot/UnifiedAudioRadio (GreyHairAsuka APPROVED++)"
 
 SEARCH_LIMIT = 50
 PAGE_SIZE = 10
 REACTION_TIMEOUT = 35.0
 
 WATCHDOG_INTERVAL = 8.0
-SUMMON_GRACE_SECONDS = 6.0
+SUMMON_GRACE_SECONDS = 10.0
+HOME_GRACE_SECONDS = 15.0
 
-REASSURE_TICK = 10.0  # internal tick; sending is interval-gated
+REASSURE_TICK = 10.0
 
-# unlock recovery timing
-RECOVERY_DELAY_SEC = 0.8
 
-# watchdog grace while rrhome is summoning
-HOME_GRACE_SECONDS = 12.0
+def _looks_like_youtube(text: str) -> bool:
+    t = (text or "").lower()
+    return any(
+        x in t
+        for x in (
+            "youtu.be",
+            "youtube.com",
+            "youtube ",
+            " yt ",
+            "ytsearch:",
+            "youtubemusic",
+        )
+    )
 
 
 @dataclass(frozen=True)
@@ -63,15 +73,21 @@ class Station:
         return Station(name=name, country=country, bitrate=bitrate, tags=tags, stream_url=stream_url)
 
 
-class RedRadio(commands.Cog):
+class UnifiedAudioRadio(commands.Cog):
     """
-    Grey Hair Asuka Approved Radio Cog (Red) + DJ Asuka reassurance (station-name only).
+    Grey Hair Asuka Unified Media Safety Layer (Audio + Radio + Watchdog)
 
-    Key fixes:
-    - Audio disconnect is treated as INTENTIONAL "suspend" (no panic)
-    - Watchdog will not panic if suspended=True
-    - rrhome clears suspension and safely re-arms audio
+    Adds DJ Asuka-specific behavior:
+    - Notify DJ when YouTube starts
+    - Notify DJ when YouTube stops
+    - DJ can request radio back via g!djradio (notifies Grey Hair Asuka)
+    - NEW: g!rrrestore instantly restores the last saved station
     """
+
+    AUDIO_SUMMON_ALIASES: Set[str] = {"summon", "join", "connect"}
+    AUDIO_DISCONNECT_ALIASES: Set[str] = {"disconnect", "dc", "leave"}
+    AUDIO_STOP_ALIASES: Set[str] = {"stop"}
+    AUDIO_PLAY_ALIASES: Set[str] = {"play", "local", "playurl", "playlist"}  # best-effort; varies by Audio version
 
     def __init__(self, bot):
         self.bot = bot
@@ -79,39 +95,43 @@ class RedRadio(commands.Cog):
 
         self.config = Config.get_conf(self, identifier=90210, force_registration=True)
         self.config.register_global(
-            # playback state (station only)
-            stream_url=None,
-            station_name=None,
-            last_search_query=None,
-
             # perimeter
+            bound=False,
             allowed_guild_id=None,
             control_text_channel_id=None,
             allowed_voice_channel_id=None,
-
-            # filters
-            min_bitrate_kbps=64,
-            block_tags_csv="phonk,earrape,nsfw",
-
-            # security + ops
             audit_channel_id=None,
-            bound=False,
+            bound_owner_user_id=None,  # who bound
+            # posture
             panic_locked=True,
             autopanic_enabled=True,
             autopanic_reason=None,
-
-            # NEW: intentional suspension (e.g., you used Audio disconnect)
             suspended=False,
-
+            suspend_reason=None,
+            hard_mode=True,
+            # radio state
+            stream_url=None,
+            station_name=None,
+            last_station_name=None,
+            last_station_stream_url=None,
+            last_search_query=None,
+            # audio intent
+            audio_intent_active=False,
+            audio_intent_started_monotonic=0.0,
+            # filters
+            min_bitrate_kbps=64,
+            block_tags_csv="phonk,earrape,nsfw",
             # DJ Asuka identity
             dj_user_id=None,
-
-            # periodic reassurance
+            # periodic reassurance (general)
             periodic_reassure_enabled=True,
             reassure_interval_in_vc_sec=300,
             reassure_interval_out_vc_sec=900,
             reassure_use_dm=True,
             reassure_fallback_channel_id=None,
+            # DJ start/stop notifications
+            dj_notify_youtube_start=True,
+            dj_notify_youtube_stop=True,
         )
 
         self._stations_cache: List[Station] = []
@@ -129,76 +149,7 @@ class RedRadio(commands.Cog):
         self._last_reassure_out_vc_ts: float = 0.0
 
     # -------------------------
-    # Voice abstraction (discord.py VoiceClient vs Red Audio Lavalink Player)
-    # -------------------------
-    def _vc_connected(self, vc) -> bool:
-        if vc is None:
-            return False
-
-        meth = getattr(vc, "is_connected", None)
-        if callable(meth):
-            try:
-                return bool(meth())
-            except Exception:
-                return False
-
-        val = getattr(vc, "connected", None)
-        if isinstance(val, bool):
-            return val
-
-        val2 = getattr(vc, "is_connected", None)
-        if isinstance(val2, bool):
-            return val2
-
-        return False
-
-    def _vc_channel_id(self, vc) -> Optional[int]:
-        if vc is None:
-            return None
-
-        ch = getattr(vc, "channel", None)
-        if ch is not None and hasattr(ch, "id"):
-            try:
-                return int(ch.id)
-            except Exception:
-                pass
-
-        for attr in ("channel_id", "voice_channel_id"):
-            v = getattr(vc, attr, None)
-            if isinstance(v, int):
-                return v
-            if isinstance(v, str) and v.isdigit():
-                return int(v)
-
-        return None
-
-    async def _vc_disconnect(self, vc) -> None:
-        if vc is None:
-            return
-        disc = getattr(vc, "disconnect", None)
-        if callable(disc):
-            try:
-                await disc(force=True)
-                return
-            except TypeError:
-                await disc()
-            except Exception:
-                pass
-
-    def _player_is_playing(self, guild: discord.Guild) -> bool:
-        p = guild.voice_client
-        v = getattr(p, "is_playing", None)
-        if isinstance(v, bool):
-            return v
-        if callable(v):
-            try:
-                return bool(v())
-            except Exception:
-                return False
-        return False
-
-    # -------------------------
-    # Lifecycle
+    # Red lifecycle
     # -------------------------
     async def cog_load(self) -> None:
         if self.http is None or self.http.closed:
@@ -230,28 +181,266 @@ class RedRadio(commands.Cog):
             await self.cog_load()
         return self.http  # type: ignore[return-value]
 
-    def format_help_for_context(self, ctx: commands.Context) -> str:
-        try:
-            is_owner = self.bot.is_owner(ctx.author)  # type: ignore[arg-type]
-        except Exception:
-            is_owner = False
-        return super().format_help_for_context(ctx) if is_owner else "Restricted."
+    # -------------------------
+    # Voice abstraction (discord.py VoiceClient vs Red Audio Lavalink Player)
+    # -------------------------
+    def _vc_connected(self, vc) -> bool:
+        if vc is None:
+            return False
+        meth = getattr(vc, "is_connected", None)
+        if callable(meth):
+            try:
+                return bool(meth())
+            except Exception:
+                return False
+        val = getattr(vc, "connected", None)
+        if isinstance(val, bool):
+            return val
+        val2 = getattr(vc, "is_connected", None)
+        if isinstance(val2, bool):
+            return val2
+        return False
+
+    def _vc_channel_id(self, vc) -> Optional[int]:
+        if vc is None:
+            return None
+        ch = getattr(vc, "channel", None)
+        if ch is not None and hasattr(ch, "id"):
+            try:
+                return int(ch.id)
+            except Exception:
+                pass
+        for attr in ("channel_id", "voice_channel_id"):
+            v = getattr(vc, attr, None)
+            if isinstance(v, int):
+                return v
+            if isinstance(v, str) and v.isdigit():
+                return int(v)
+        return None
+
+    async def _vc_disconnect(self, vc) -> None:
+        if vc is None:
+            return
+        disc = getattr(vc, "disconnect", None)
+        if callable(disc):
+            try:
+                await disc(force=True)
+                return
+            except TypeError:
+                await disc()
+            except Exception:
+                pass
+
+    def _player_is_playing(self, guild: discord.Guild) -> bool:
+        p = guild.voice_client
+        v = getattr(p, "is_playing", None)
+        if isinstance(v, bool):
+            return v
+        if callable(v):
+            try:
+                return bool(v())
+            except Exception:
+                return False
+        return False
 
     # -------------------------
-    # Gates
+    # State helpers
+    # -------------------------
+    async def _radio_active(self) -> bool:
+        return bool(await self.config.stream_url() and await self.config.station_name())
+
+    async def _audio_intent_active(self) -> bool:
+        return bool(await self.config.audio_intent_active())
+
+    async def _any_active(self, guild: Optional[discord.Guild] = None) -> bool:
+        if await self._radio_active():
+            return True
+        if await self._audio_intent_active():
+            return True
+        if guild and self._player_is_playing(guild):
+            return True
+        return False
+
+    async def _bot_is_home(self, guild: discord.Guild) -> bool:
+        allowed_vc_id = await self.config.allowed_voice_channel_id()
+        if not allowed_vc_id:
+            return False
+        vc = guild.voice_client
+        if not self._vc_connected(vc):
+            return False
+        cid = self._vc_channel_id(vc)
+        return bool(cid and int(cid) == int(allowed_vc_id))
+
+    # -------------------------
+    # Audit / notify
+    # -------------------------
+    async def _audit_security(self, guild: discord.Guild, reason: str) -> None:
+        try:
+            log.warning("[SECURITY] %s | guild=%s (%s)", reason, guild.name, guild.id)
+            audit_channel_id = await self.config.audit_channel_id()
+            if audit_channel_id:
+                ch = guild.get_channel(int(audit_channel_id))
+                if ch:
+                    embed = discord.Embed(title="🛡️ Security", description=reason, color=discord.Color.orange())
+                    await ch.send(embed=embed)
+        except Exception:
+            pass
+
+    async def _control_channel(self, guild: discord.Guild) -> Optional[discord.TextChannel]:
+        cid = await self.config.control_text_channel_id()
+        if not cid:
+            return None
+        ch = guild.get_channel(int(cid))
+        return ch if isinstance(ch, discord.TextChannel) else None
+
+    async def _notify_control(self, guild: discord.Guild, title: str, description: str, color: discord.Color):
+        try:
+            ch = await self._control_channel(guild)
+            if not ch:
+                return
+            embed = discord.Embed(title=title, description=description, color=color)
+            await ch.send(embed=embed)
+        except Exception:
+            pass
+
+    async def _set_presence(self, label: Optional[str]) -> None:
+        try:
+            if label:
+                await self.bot.change_presence(activity=discord.Game(name=label))
+            else:
+                await self.bot.change_presence(activity=None)
+        except Exception:
+            pass
+
+    async def _suspend(self, reason: str) -> None:
+        await self.config.suspended.set(True)
+        await self.config.suspend_reason.set(reason)
+        await self._set_presence(None)
+
+    async def _unsuspend(self) -> None:
+        await self.config.suspended.set(False)
+        await self.config.suspend_reason.set(None)
+
+    async def _clear_radio_state(self) -> None:
+        await self.config.stream_url.set(None)
+        await self.config.station_name.set(None)
+
+    async def _clear_audio_intent(self) -> None:
+        await self.config.audio_intent_active.set(False)
+        await self.config.audio_intent_started_monotonic.set(0.0)
+
+    async def _autopanic(self, guild: discord.Guild, reason: str) -> None:
+        if not await self.config.autopanic_enabled():
+            return
+        async with self._autopanic_lock:
+            if await self.config.panic_locked():
+                return
+
+            await self.config.panic_locked.set(True)
+            await self.config.autopanic_reason.set(reason)
+
+            try:
+                await self._vc_disconnect(guild.voice_client)
+            except Exception:
+                pass
+
+            await self._clear_radio_state()
+            await self._clear_audio_intent()
+            await self._set_presence(None)
+
+            await self._audit_security(guild, f"Auto-panic: {reason}")
+            await self._notify_control(
+                guild,
+                "🛑 Panic Engaged",
+                f"{reason}\n\nUse `rrunlock` in the control channel (while you’re in the locked VC).",
+                discord.Color.red(),
+            )
+
+    # -------------------------
+    # DJ messaging
+    # -------------------------
+    async def _send_to_dj(self, guild: discord.Guild, embed: discord.Embed) -> None:
+        dj_user_id = await self.config.dj_user_id()
+        if not dj_user_id:
+            return
+        member = guild.get_member(int(dj_user_id))
+        if not member:
+            return
+
+        use_dm = await self.config.reassure_use_dm()
+        fallback_id = await self.config.reassure_fallback_channel_id()
+        control_id = await self.config.control_text_channel_id()
+
+        if use_dm:
+            try:
+                await member.send(embed=embed)
+                return
+            except Exception:
+                pass
+
+        ch = None
+        if fallback_id:
+            ch = guild.get_channel(int(fallback_id))
+        if ch is None and control_id:
+            ch = guild.get_channel(int(control_id))
+        if not isinstance(ch, discord.TextChannel):
+            return
+
+        try:
+            await ch.send(content=member.mention, embed=embed)
+        except Exception:
+            pass
+
+    async def _dj_youtube_started(self, guild: discord.Guild):
+        if not await self.config.dj_notify_youtube_start():
+            return
+        last_station = await self.config.last_station_name()
+        line = f"Last radio station saved: **{last_station}**" if last_station else "Radio state saved."
+        embed = discord.Embed(
+            title="🖤 It’s okay.",
+            description="YouTube started. I’m still here. You’re safe.\n" + line,
+            color=discord.Color.dark_teal(),
+        )
+        embed.set_footer(text="If you want the radio back, use: g!djradio")
+        await self._send_to_dj(guild, embed)
+
+    async def _dj_youtube_stopped(self, guild: discord.Guild):
+        if not await self.config.dj_notify_youtube_stop():
+            return
+        last_station = await self.config.last_station_name()
+        msg = (
+            f"YouTube stopped. If you want the radio back: **g!djradio**\nLast station: **{last_station}**"
+            if last_station
+            else "YouTube stopped. If you want the radio back: **g!djradio**"
+        )
+        embed = discord.Embed(title="🖤 It’s okay.", description=msg, color=discord.Color.dark_teal())
+        embed.set_footer(text="Grey Hair Asuka protocol: stable transitions.")
+        await self._send_to_dj(guild, embed)
+
+    # -------------------------
+    # Cog gating (this cog only)
     # -------------------------
     async def cog_check(self, ctx: commands.Context) -> bool:
         if ctx.guild is None:
             return False
 
+        cmd = (ctx.command.qualified_name if ctx.command else "").lower()
+
+        # DJ-only command bypass
+        if cmd == "djradio":
+            allowed_guild_id = await self.config.allowed_guild_id()
+            dj_user_id = await self.config.dj_user_id()
+            if allowed_guild_id and ctx.guild.id != int(allowed_guild_id):
+                return False
+            return bool(dj_user_id and ctx.author.id == int(dj_user_id))
+
+        # Owner only for everything else
         try:
             is_owner = await self.bot.is_owner(ctx.author)  # type: ignore[arg-type]
         except Exception:
             is_owner = False
         if not is_owner:
             return False
-
-        cmd = (ctx.command.qualified_name if ctx.command else "").lower()
 
         prebind_ok = {"rrbind", "rrstatus"}
         if not await self.config.bound():
@@ -261,20 +450,19 @@ class RedRadio(commands.Cog):
             return False
 
         allowed_guild_id = await self.config.allowed_guild_id()
-        if allowed_guild_id and ctx.guild.id != allowed_guild_id:
+        if allowed_guild_id and ctx.guild.id != int(allowed_guild_id):
             await self._audit_security(ctx.guild, f"Denied: wrong guild ({ctx.guild.id})")
             return False
 
-        bypass_control_channel = {"rrcontrol", "rrstatus", "rrpanic", "rrunlock"}
-
-        control_text_channel_id = await self.config.control_text_channel_id()
-        if control_text_channel_id and ctx.channel.id != control_text_channel_id:
-            if cmd not in bypass_control_channel:
+        bypass_control = {"rrcontrol", "rrstatus", "rrpanic", "rrunlock", "rrresume", "rrsuspend", "rrhard"}
+        control_id = await self.config.control_text_channel_id()
+        if control_id and ctx.channel.id != int(control_id):
+            if cmd not in bypass_control:
                 await self._audit_security(ctx.guild, f"Denied: outside control channel ({ctx.channel.id})")
                 return False
 
         if await self.config.panic_locked():
-            panic_ok = {"rrstatus", "rrunlock", "rrpanic", "rrcontrol"}
+            panic_ok = {"rrstatus", "rrunlock", "rrpanic", "rrcontrol", "rrhard"}
             if cmd in panic_ok:
                 return True
             await ctx.send("Panic lock is active.")
@@ -292,167 +480,193 @@ class RedRadio(commands.Cog):
             await ctx.send("Get in the locked voice channel first.")
             return False
 
-        if ctx.author.voice.channel.id != allowed_vc_id:
+        if ctx.author.voice.channel.id != int(allowed_vc_id):
             await ctx.send("Wrong voice channel.")
             await self._audit_security(ctx.guild, f"Denied: owner not in allowed VC ({ctx.author.voice.channel.id})")
             return False
 
         return True
 
-    async def _bot_is_home(self, guild: discord.Guild) -> bool:
-        allowed_vc_id = await self.config.allowed_voice_channel_id()
-        if not allowed_vc_id:
-            return False
-
-        vc = guild.voice_client
-        if not self._vc_connected(vc):
-            return False
-
-        cid = self._vc_channel_id(vc)
-        return bool(cid and int(cid) == int(allowed_vc_id))
-
     async def _require_bot_home(self, ctx: commands.Context) -> bool:
         if not ctx.guild:
             return False
+        if not await self._bot_is_home(ctx.guild):
+            await ctx.send("Bot is not home. Use `rrhome` while you are in the locked VC.")
+            return False
+        return True
+
+    # -------------------------
+    # Audio wrappers
+    # -------------------------
+    def _get_cmd(self, name: str):
+        return self.bot.get_command(name)
+
+    async def _invoke_audio(self, ctx: commands.Context, name: str, **kwargs) -> Tuple[bool, str]:
+        cmd = self._get_cmd(name)
+        if cmd is None:
+            return False, f"❌ Audio command `{name}` not found."
+        try:
+            await ctx.invoke(cmd, **kwargs)
+            return True, ""
+        except Exception as e:
+            return False, f"❌ Audio `{name}` failed: `{type(e).__name__}: {e}`"
+
+    async def _audio_play(self, ctx: commands.Context, query: str) -> bool:
+        ok, msg = await self._invoke_audio(ctx, "play", query=query)
+        if not ok:
+            await ctx.send(msg)
+            return False
+        return True
+
+    async def _audio_stop(self, ctx: commands.Context) -> None:
+        await self._invoke_audio(ctx, "stop")
+
+    async def _audio_summon(self, ctx: commands.Context) -> bool:
+        ok, msg = await self._invoke_audio(ctx, "summon")
+        if not ok:
+            await ctx.send(msg)
+            return False
+        return True
+
+    # -------------------------
+    # Audio compatibility tripwire + DJ start/stop detection
+    # -------------------------
+    async def _audio_cmd_is_allowed(self, ctx: commands.Context) -> bool:
+        if not ctx.guild:
+            return False
+        if not await self.config.bound():
+            return False
+
+        allowed_guild_id = await self.config.allowed_guild_id()
+        if allowed_guild_id and ctx.guild.id != int(allowed_guild_id):
+            return False
+
+        try:
+            is_owner = await self.bot.is_owner(ctx.author)  # type: ignore[arg-type]
+        except Exception:
+            is_owner = False
+        if not is_owner:
+            return False
+
+        control_id = await self.config.control_text_channel_id()
+        if control_id and ctx.channel.id != int(control_id):
+            return False
 
         allowed_vc_id = await self.config.allowed_voice_channel_id()
         if not allowed_vc_id:
-            await ctx.send("Voice lock is not set. Rebind with rrbind.")
             return False
-
-        vc = ctx.guild.voice_client
-        if not self._vc_connected(vc):
-            await ctx.send("Bot is not in voice. Use `rrhome` while you are in the locked VC.")
+        if not ctx.author.voice or not ctx.author.voice.channel:
             return False
-
-        cid = self._vc_channel_id(vc)
-        if not cid:
-            await ctx.send("Voice state unknown. (No channel id)")
-            return False
-
-        if int(cid) != int(allowed_vc_id):
-            await self._autopanic(ctx.guild, f"Control attempted while bot in wrong VC ({cid})")
-            await ctx.send("Bot is in the wrong voice channel. Auto-panic engaged.")
+        if ctx.author.voice.channel.id != int(allowed_vc_id):
             return False
 
         return True
 
-    # -------------------------
-    # Audit + panic
-    # -------------------------
-    async def _audit_security(self, guild: discord.Guild, reason: str) -> None:
-        try:
-            log.warning("[SECURITY] %s | guild=%s (%s)", reason, guild.name, guild.id)
-            audit_channel_id = await self.config.audit_channel_id()
-            if audit_channel_id:
-                ch = guild.get_channel(audit_channel_id)
-                if ch:
-                    embed = discord.Embed(title="🛡️ Security", description=reason, color=discord.Color.orange())
-                    await ch.send(embed=embed)
-        except Exception:
-            pass
-
-    async def _autopanic(self, guild: discord.Guild, reason: str) -> None:
-        if not await self.config.autopanic_enabled():
-            return
-
-        async with self._autopanic_lock:
-            if await self.config.panic_locked():
-                return
-
-            await self.config.panic_locked.set(True)
-            await self.config.autopanic_reason.set(reason)
-
-            try:
-                await self._vc_disconnect(guild.voice_client)
-            except Exception:
-                pass
-
-            await self._set_presence_station(None)
-            await self._audit_security(guild, f"Auto-panic: {reason}")
-
-    # -------------------------
-    # Tripwire: rrhome is only summon path + detect Audio disconnect => suspend
-    # -------------------------
     @commands.Cog.listener()
     async def on_command(self, ctx: commands.Context):
         try:
             if not ctx.guild or not ctx.command:
                 return
-            if not await self.config.bound():
-                return
-
-            allowed_guild_id = await self.config.allowed_guild_id()
-            if allowed_guild_id and ctx.guild.id != allowed_guild_id:
-                return
 
             cog = (ctx.command.cog_name or "").lower()
-            name = (ctx.command.name or "").lower()
-
-            # If you used Audio's disconnect, treat as intentional suspend (no panic)
-            if cog == "audio" and name in {"disconnect"}:
-                if await self.config.stream_url():
-                    await self.config.suspended.set(True)
-                    await self._set_presence_station(None)
-                return
-
-            # rrhome is the only allowed summon path
-            if name != "summon":
-                return
             if cog != "audio":
                 return
 
-            if time.monotonic() <= self._allow_summon_until:
+            name = (ctx.command.name or "").lower()
+            allowed = await self._audio_cmd_is_allowed(ctx)
+
+            # If rrhome just authorized summon, ignore.
+            if name in self.AUDIO_SUMMON_ALIASES and time.monotonic() <= self._allow_summon_until:
                 return
 
-            await self._autopanic(ctx.guild, "Unauthorized Audio summon (not via rrhome)")
+            # Allowed inside perimeter: keep state consistent + DJ notifications.
+            if allowed:
+                # PLAY: detect YouTube-ish start
+                if name in self.AUDIO_PLAY_ALIASES:
+                    content = (ctx.message.content or "")
+                    if _looks_like_youtube(content):
+                        # Save last station if radio was active
+                        if await self._radio_active():
+                            await self.config.last_station_name.set(await self.config.station_name())
+                            await self.config.last_station_stream_url.set(await self.config.stream_url())
+                            await self._clear_radio_state()
+                            await self._set_presence(None)
+
+                        await self.config.audio_intent_active.set(True)
+                        await self.config.audio_intent_started_monotonic.set(float(time.monotonic()))
+                        await self._dj_youtube_started(ctx.guild)
+
+                # STOP/DISCONNECT: stop notifications + clear states
+                if name in self.AUDIO_STOP_ALIASES:
+                    await self._clear_radio_state()
+                    await self._clear_audio_intent()
+                    await self._set_presence(None)
+                    await self._dj_youtube_stopped(ctx.guild)
+
+                if name in self.AUDIO_DISCONNECT_ALIASES:
+                    await self._clear_radio_state()
+                    await self._clear_audio_intent()
+                    await self._set_presence(None)
+                    now = time.monotonic()
+                    self._home_grace_until = now + HOME_GRACE_SECONDS
+                    self._allow_summon_until = now + SUMMON_GRACE_SECONDS
+                    await self._dj_youtube_stopped(ctx.guild)
+
+                return
+
+            # Not allowed: only react if something is active.
+            if not await self._any_active(ctx.guild):
+                return
+
+            hard = await self.config.hard_mode()
+            if hard:
+                await self._autopanic(ctx.guild, f"Audio `{name}` used outside perimeter while active")
+            else:
+                await self._suspend(f"Audio `{name}` used outside perimeter while active")
+                await self._notify_control(
+                    ctx.guild,
+                    "🟡 Suspended (Soft)",
+                    f"Audio `{name}` was used outside the perimeter while media was active.\n"
+                    f"Use `rrresume` (in control channel, in locked VC) to continue safely.",
+                    discord.Color.gold(),
+                )
+
         except Exception:
             pass
 
     # -------------------------
-    # Watchdog loop
+    # Watchdog
     # -------------------------
     async def _watchdog_loop(self):
         await self.bot.wait_until_ready()
-
         while self.bot.is_ready():
             try:
                 await asyncio.sleep(WATCHDOG_INTERVAL)
 
                 if not await self.config.bound():
                     continue
-
-                # Grace while rrhome is moving
+                if await self.config.panic_locked():
+                    continue
+                if await self.config.suspended():
+                    continue
                 if time.monotonic() <= self._home_grace_until:
                     continue
 
                 guild_id = await self.config.allowed_guild_id()
-                vc_id = await self.config.allowed_voice_channel_id()
-                if not guild_id or not vc_id:
+                if not guild_id:
                     continue
 
                 guild = self.bot.get_guild(int(guild_id))
                 if not guild:
                     continue
 
-                if await self.config.panic_locked():
+                active = await self._any_active(guild)
+                if not active:
                     continue
 
-                stream_url = await self.config.stream_url()
-                home = await self._bot_is_home(guild)
-                suspended = await self.config.suspended()
-
-                # If intentionally suspended, do NOT panic just because we aren't home.
-                if stream_url and not home and not suspended:
-                    await self._autopanic(guild, "Watchdog: station set but bot is not home")
+                if not await self._bot_is_home(guild):
+                    await self._autopanic(guild, "Watchdog: media active but bot is not home")
                     continue
-
-                vc = guild.voice_client
-                if self._vc_connected(vc):
-                    cid = self._vc_channel_id(vc)
-                    if cid and int(cid) != int(vc_id):
-                        await self._autopanic(guild, f"Watchdog: bot in wrong VC ({cid})")
-                        continue
 
             except asyncio.CancelledError:
                 break
@@ -460,36 +674,10 @@ class RedRadio(commands.Cog):
                 log.exception("Watchdog loop error")
 
     # -------------------------
-    # DJ Asuka reassurance
+    # Periodic reassurance loop (general)
     # -------------------------
-    async def _send_to_dj(self, guild: discord.Guild, member: discord.Member, embed: discord.Embed) -> None:
-        use_dm = await self.config.reassure_use_dm()
-        fallback_id = await self.config.reassure_fallback_channel_id()
-        control_id = await self.config.control_text_channel_id()
-
-        if use_dm:
-            try:
-                await member.send(embed=embed)
-                return
-            except Exception:
-                pass
-
-        ch = None
-        if fallback_id:
-            ch = guild.get_channel(int(fallback_id))
-        if ch is None and control_id:
-            ch = guild.get_channel(int(control_id))
-        if ch is None:
-            return
-
-        try:
-            await ch.send(content=member.mention, embed=embed)
-        except Exception:
-            pass
-
     async def _periodic_reassurance_loop(self):
         await self.bot.wait_until_ready()
-
         while self.bot.is_ready():
             try:
                 await asyncio.sleep(REASSURE_TICK)
@@ -498,28 +686,23 @@ class RedRadio(commands.Cog):
                     continue
                 if await self.config.panic_locked():
                     continue
-                if not await self.config.periodic_reassure_enabled():
-                    continue
-
-                # If you intentionally suspended (audio disconnect), don't reassure as "home".
                 if await self.config.suspended():
+                    continue
+                if not await self.config.periodic_reassure_enabled():
                     continue
 
                 guild_id = await self.config.allowed_guild_id()
                 allowed_vc_id = await self.config.allowed_voice_channel_id()
                 dj_user_id = await self.config.dj_user_id()
-                stream_url = await self.config.stream_url()
-                station_name = await self.config.station_name()
-
                 if not guild_id or not allowed_vc_id or not dj_user_id:
-                    continue
-                if not stream_url or not station_name:
                     continue
 
                 guild = self.bot.get_guild(int(guild_id))
                 if not guild:
                     continue
 
+                if not await self._any_active(guild):
+                    continue
                 if not await self._bot_is_home(guild):
                     continue
 
@@ -528,44 +711,48 @@ class RedRadio(commands.Cog):
                     continue
 
                 dj_in_allowed_vc = bool(
-                    member.voice
-                    and member.voice.channel
-                    and member.voice.channel.id == int(allowed_vc_id)
+                    member.voice and member.voice.channel and member.voice.channel.id == int(allowed_vc_id)
                 )
+
+                radio = await self._radio_active()
+                station_name = await self.config.station_name() if radio else None
+                last_station = await self.config.last_station_name()
+
+                if radio and station_name:
+                    line = f"**Station:** {station_name}"
+                elif last_station:
+                    line = f"**Media:** playback active\n**Radio saved:** {last_station}"
+                else:
+                    line = "**Media:** playback active"
 
                 now = time.monotonic()
 
                 if dj_in_allowed_vc:
-                    interval = int(await self.config.reassure_interval_in_vc_sec() or 0)
-                    if interval < 30:
-                        interval = 30
+                    interval = max(int(await self.config.reassure_interval_in_vc_sec() or 0), 30)
                     if now - self._last_reassure_in_vc_ts < interval:
                         continue
                     self._last_reassure_in_vc_ts = now
 
                     embed = discord.Embed(
                         title="🖤 It’s okay.",
-                        description=f"You're safe. I’m here. We’re staying home.\n**Station:** {station_name}",
+                        description=f"You're safe. I’m here. We’re staying home.\n{line}",
                         color=discord.Color.dark_teal(),
                     )
                     embed.set_footer(text="Grey Hair Asuka protocol: reassurance (in VC).")
-                    await self._send_to_dj(guild, member, embed)
-
+                    await self._send_to_dj(guild, embed)
                 else:
-                    interval = int(await self.config.reassure_interval_out_vc_sec() or 0)
-                    if interval < 60:
-                        interval = 60
+                    interval = max(int(await self.config.reassure_interval_out_vc_sec() or 0), 60)
                     if now - self._last_reassure_out_vc_ts < interval:
                         continue
                     self._last_reassure_out_vc_ts = now
 
                     embed = discord.Embed(
                         title="🖤 It’s okay.",
-                        description=f"I'm still here. You're safe even if you're not in the room.\n**Station:** {station_name}",
+                        description=f"I'm still here. You're safe even if you're not in the room.\n{line}",
                         color=discord.Color.dark_teal(),
                     )
                     embed.set_footer(text="Grey Hair Asuka protocol: reassurance (out of VC).")
-                    await self._send_to_dj(guild, member, embed)
+                    await self._send_to_dj(guild, embed)
 
             except asyncio.CancelledError:
                 break
@@ -573,7 +760,7 @@ class RedRadio(commands.Cog):
                 log.exception("Periodic reassurance loop error")
 
     # -------------------------
-    # Radio-browser + Audio helpers
+    # Radio-browser
     # -------------------------
     async def _rb_get_json(self, path: str) -> Optional[Any]:
         session = await self._ensure_http()
@@ -589,64 +776,6 @@ class RedRadio(commands.Cog):
         except Exception:
             return None
 
-    async def _set_presence_station(self, station_name: Optional[str]) -> None:
-        try:
-            if station_name:
-                await self.bot.change_presence(activity=discord.Game(name=f"📻 {station_name}"))
-            else:
-                await self.bot.change_presence(activity=None)
-        except Exception:
-            pass
-
-    async def _audio_play(self, ctx: commands.Context, stream_url: str) -> bool:
-        play_cmd = self.bot.get_command("play")
-        if play_cmd is None:
-            await ctx.send("❌ Audio cog / `play` not found.")
-            return False
-        await ctx.invoke(play_cmd, query=stream_url)
-        return True
-
-    async def _audio_stop(self, ctx: commands.Context) -> bool:
-        stop_cmd = self.bot.get_command("stop")
-        if stop_cmd is None:
-            await ctx.send("❌ Audio cog / `stop` not found.")
-            return False
-        await ctx.invoke(stop_cmd)
-        return True
-
-    async def _clear_state(self) -> None:
-        await self.config.stream_url.set(None)
-        await self.config.station_name.set(None)
-        await self.config.suspended.set(False)
-
-    async def _requeue_station_if_needed(self, ctx: commands.Context) -> None:
-        if not ctx.guild:
-            return
-
-        stream_url = await self.config.stream_url()
-        station_name = await self.config.station_name()
-        if not stream_url or not station_name:
-            return
-
-        if self._player_is_playing(ctx.guild):
-            await self._set_presence_station(station_name)
-            return
-
-        try:
-            await self._audio_stop(ctx)
-        except Exception:
-            pass
-
-        await asyncio.sleep(RECOVERY_DELAY_SEC)
-
-        ok = await self._audio_play(ctx, stream_url)
-        if ok:
-            await self._set_presence_station(station_name)
-            try:
-                await ctx.send(f"🔁 Re-armed stream: **{station_name}**")
-            except Exception:
-                pass
-
     def _blocked_by_tags(self, station: Station, blocked_tags: List[str]) -> bool:
         blob = f"{station.tags} {station.name}".lower()
         return any(t and t in blob for t in blocked_tags)
@@ -659,7 +788,7 @@ class RedRadio(commands.Cog):
         )
         start_index = page * PAGE_SIZE
         for idx, s in enumerate(page_items, start=start_index + 1):
-            tags = s.tags
+            tags = s.tags if s.tags else "No tags"
             if len(tags) > 100:
                 tags = tags[:97] + "..."
             embed.add_field(
@@ -671,7 +800,7 @@ class RedRadio(commands.Cog):
         return embed
 
     # -------------------------
-    # Owner commands
+    # Owner commands (bind/control/home/radio)
     # -------------------------
     @commands.is_owner()
     @commands.command()
@@ -685,14 +814,25 @@ class RedRadio(commands.Cog):
         await self.config.allowed_guild_id.set(ctx.guild.id)
         await self.config.control_text_channel_id.set(ctx.channel.id)
         await self.config.allowed_voice_channel_id.set(ctx.author.voice.channel.id)
+        await self.config.bound_owner_user_id.set(ctx.author.id)
 
         await self.config.bound.set(True)
         await self.config.panic_locked.set(False)
         await self.config.autopanic_enabled.set(True)
         await self.config.autopanic_reason.set(None)
-        await self.config.suspended.set(False)
+
+        await self._unsuspend()
+        await self._clear_radio_state()
+        await self._clear_audio_intent()
+        await self._set_presence(None)
 
         await ctx.send("Bound. Use rrsetdj to set DJ Asuka. Use rrhome to bring her home.")
+
+    @commands.is_owner()
+    @commands.command()
+    async def rrsetdj(self, ctx: commands.Context, member: discord.Member):
+        await self.config.dj_user_id.set(member.id)
+        await ctx.send(f"DJ Asuka target set to: {member.mention}")
 
     @commands.is_owner()
     @commands.command()
@@ -704,169 +844,26 @@ class RedRadio(commands.Cog):
             return
 
         allowed_guild_id = await self.config.allowed_guild_id()
-        if allowed_guild_id and ctx.guild.id != allowed_guild_id:
+        if allowed_guild_id and ctx.guild.id != int(allowed_guild_id):
             await ctx.send("Wrong guild.")
             return
 
         if not await self._require_owner_in_allowed_vc(ctx):
             return
 
-        old_id = await self.config.control_text_channel_id()
-        old_ch = ctx.guild.get_channel(int(old_id)) if old_id else None
-
         target = channel or ctx.channel
         await self.config.control_text_channel_id.set(target.id)
 
-        fallback = await self.config.reassure_fallback_channel_id()
-        if not fallback:
+        if not await self.config.reassure_fallback_channel_id():
             await self.config.reassure_fallback_channel_id.set(target.id)
 
         embed = discord.Embed(
             title="🛡️ Control Channel Re-Keyed",
-            description="Control channel has been moved.",
+            description=f"Control channel moved to {target.mention}.",
             color=discord.Color.orange(),
         )
-        embed.add_field(name="Old", value=(old_ch.mention if old_ch else "Unknown / unset"), inline=True)
-        embed.add_field(name="New", value=target.mention, inline=True)
         embed.set_footer(text="Grey Hair Asuka protocol: re-key control room.")
         await ctx.send(embed=embed)
-
-        try:
-            audit_id = await self.config.audit_channel_id()
-            if audit_id:
-                ach = ctx.guild.get_channel(int(audit_id))
-                if ach and ach.id != ctx.channel.id:
-                    await ach.send(embed=embed)
-        except Exception:
-            pass
-
-    @commands.is_owner()
-    @commands.command()
-    async def rrstatus(self, ctx: commands.Context):
-        bound = await self.config.bound()
-        panic = await self.config.panic_locked()
-        reason = await self.config.autopanic_reason()
-        g = await self.config.allowed_guild_id()
-        t = await self.config.control_text_channel_id()
-        v = await self.config.allowed_voice_channel_id()
-        station = await self.config.station_name()
-        stream = await self.config.stream_url()
-        dj = await self.config.dj_user_id()
-        pr = await self.config.periodic_reassure_enabled()
-        inv = await self.config.reassure_interval_in_vc_sec()
-        outv = await self.config.reassure_interval_out_vc_sec()
-        dm = await self.config.reassure_use_dm()
-        fb = await self.config.reassure_fallback_channel_id()
-        suspended = await self.config.suspended()
-
-        home = await self._bot_is_home(ctx.guild) if ctx.guild else False
-        playing = self._player_is_playing(ctx.guild) if ctx.guild else False
-
-        desc = [
-            f"**Bound:** {bound}",
-            f"**Panic:** {panic}",
-            f"**Reason:** {reason}" if reason else "",
-            f"**Suspended:** {suspended}",
-            f"**Home:** {home}",
-            f"**Player playing:** {playing}",
-            "",
-            f"**Allowed Guild:** `{g}`" if g else "",
-            f"**Control Channel:** `{t}`" if t else "",
-            f"**Allowed Voice:** `{v}`" if v else "",
-            "",
-            f"**Station:** {station}" if station else "**Station:** (none)",
-            f"**Stream set:** {bool(stream)}",
-            "",
-            f"**DJ Asuka user:** `{dj}`" if dj else "**DJ Asuka user:** (not set)",
-            f"**Periodic reassure:** {pr}",
-            f"**Intervals:** in-VC={int(inv)//60}m, out-VC={int(outv)//60}m",
-            f"**DM first:** {dm}",
-            f"**Fallback channel:** `{fb}`" if fb else "**Fallback channel:** (control channel)",
-        ]
-        embed = discord.Embed(
-            title="🛡️ Grey Hair Asuka Radio Status",
-            description="\n".join([x for x in desc if x]),
-            color=discord.Color.dark_teal(),
-        )
-        await ctx.send(embed=embed)
-
-    @commands.is_owner()
-    @commands.command()
-    async def rrpanic(self, ctx: commands.Context):
-        if not await self._require_owner_in_allowed_vc(ctx):
-            return
-
-        await self.config.panic_locked.set(True)
-        await self.config.autopanic_reason.set("Manual panic")
-
-        try:
-            await self._audio_stop(ctx)
-        except Exception:
-            pass
-
-        try:
-            await self._vc_disconnect(ctx.guild.voice_client if ctx.guild else None)
-        except Exception:
-            pass
-
-        # keep station info; unlock can recover it
-        await self._set_presence_station(None)
-        await ctx.send("🛑 Panic engaged. Controls locked.")
-
-    @commands.is_owner()
-    @commands.command()
-    async def rrunlock(self, ctx: commands.Context):
-        if not await self._require_owner_in_allowed_vc(ctx):
-            return
-
-        await self.config.panic_locked.set(False)
-        await self.config.autopanic_reason.set(None)
-        await ctx.send("Controls unlocked. Re-stabilizing…")
-
-        await self.rrhome(ctx)
-        await self._requeue_station_if_needed(ctx)
-
-    @commands.is_owner()
-    @commands.command()
-    async def rrsetdj(self, ctx: commands.Context, member: discord.Member):
-        await self.config.dj_user_id.set(member.id)
-        await ctx.send(f"DJ Asuka target set to: {member.mention}")
-
-    @commands.is_owner()
-    @commands.command()
-    async def rrreassuretoggle(self, ctx: commands.Context, enabled: bool):
-        await self.config.periodic_reassure_enabled.set(bool(enabled))
-        await ctx.send(f"Periodic reassurance: **{enabled}**")
-
-    @commands.is_owner()
-    @commands.command()
-    async def rrreassureinterval(self, ctx: commands.Context, minutes_in_vc: int, minutes_out_vc: Optional[int] = None):
-        if minutes_in_vc < 1:
-            minutes_in_vc = 1
-        if minutes_out_vc is None:
-            minutes_out_vc = max(5, minutes_in_vc * 3)
-        if minutes_out_vc < 1:
-            minutes_out_vc = 1
-
-        await self.config.reassure_interval_in_vc_sec.set(minutes_in_vc * 60)
-        await self.config.reassure_interval_out_vc_sec.set(minutes_out_vc * 60)
-        await ctx.send(f"Intervals set: in-VC={minutes_in_vc}m, out-VC={minutes_out_vc}m")
-
-    @commands.is_owner()
-    @commands.command()
-    async def rrreassuredm(self, ctx: commands.Context, enabled: bool):
-        await self.config.reassure_use_dm.set(bool(enabled))
-        await ctx.send(f"Reassurance DMs enabled: **{enabled}**")
-
-    @commands.is_owner()
-    @commands.command()
-    async def rrreassurechannel(self, ctx: commands.Context, channel: Optional[discord.TextChannel] = None):
-        if channel is None:
-            await self.config.reassure_fallback_channel_id.set(None)
-            await ctx.send("Reassurance fallback channel cleared (will use control channel).")
-        else:
-            await self.config.reassure_fallback_channel_id.set(channel.id)
-            await ctx.send(f"Reassurance fallback channel set to: {channel.mention}")
 
     @commands.is_owner()
     @commands.command()
@@ -878,30 +875,23 @@ class RedRadio(commands.Cog):
             return
 
         if ctx.guild and await self._bot_is_home(ctx.guild):
-            # If we were intentionally suspended, clear it and (optionally) re-arm audio.
-            if await self.config.suspended():
-                await self.config.suspended.set(False)
-                await self._requeue_station_if_needed(ctx)
             await ctx.send("She’s already home.")
             return
 
-        summon_cmd = self.bot.get_command("summon")
-        if summon_cmd is None:
-            await ctx.send("Audio `summon` command not found.")
-            return
-
-        # Grace windows (tripwire + watchdog)
         now = time.monotonic()
         self._allow_summon_until = now + SUMMON_GRACE_SECONDS
         self._home_grace_until = now + HOME_GRACE_SECONDS
 
-        # Coming home clears intentional suspend
-        await self.config.suspended.set(False)
+        await self._unsuspend()
 
-        await ctx.invoke(summon_cmd)
+        ok = await self._audio_summon(ctx)
+        if not ok:
+            return
 
-        # Re-arm stream if it was set
-        await self._requeue_station_if_needed(ctx)
+        if await self._radio_active():
+            station = await self.config.station_name()
+            if station:
+                await self._set_presence(f"📻 {station}")
 
         await ctx.send("Home command executed.")
 
@@ -911,6 +901,9 @@ class RedRadio(commands.Cog):
         if not await self._require_owner_in_allowed_vc(ctx):
             return
         if not await self._require_bot_home(ctx):
+            return
+        if await self.config.suspended():
+            await ctx.send("Suspended. Use `rrresume`.")
             return
 
         q = query.strip()
@@ -1002,6 +995,9 @@ class RedRadio(commands.Cog):
             return
         if not await self._require_bot_home(ctx):
             return
+        if await self.config.suspended():
+            await ctx.send("Suspended. Use `rrresume`.")
+            return
 
         async with self._cache_lock:
             stations = list(self._stations_cache)
@@ -1009,28 +1005,75 @@ class RedRadio(commands.Cog):
         if not stations:
             await ctx.send(f"No cached results. Run `{ctx.clean_prefix}searchstations <query>` first.")
             return
-
         if index < 1 or index > len(stations):
             await ctx.send(f"Invalid station number. Use 1-{len(stations)}.")
             return
 
         station = stations[index - 1]
 
+        await self.config.last_station_name.set(station.name)
+        await self.config.last_station_stream_url.set(station.stream_url)
+
+        await self._clear_audio_intent()
+
         await self.config.stream_url.set(station.stream_url)
         await self.config.station_name.set(station.name)
-        await self.config.suspended.set(False)
 
         ok = await self._audio_play(ctx, station.stream_url)
         if not ok:
             return
 
-        await self._set_presence_station(station.name)
+        await self._set_presence(f"📻 {station.name}")
 
         embed = discord.Embed(
             title="📻 Station Playing",
             description=f"**Station:** {station.name}\n**Country:** {station.country}\n🔗 [Stream Link]({station.stream_url})",
             color=discord.Color.blurple(),
         )
+        embed.set_footer(text="No track titles. Station name only.")
+        await ctx.send(embed=embed)
+
+    # ✅ NEW: one-shot restore (no index, no search cache needed)
+    @commands.is_owner()
+    @commands.command()
+    async def rrrestore(self, ctx: commands.Context):
+        """
+        Restore the last saved radio station immediately.
+        Requires: owner in locked VC + bot home + not suspended/panic.
+        """
+        if not await self._require_owner_in_allowed_vc(ctx):
+            return
+        if not await self._require_bot_home(ctx):
+            return
+        if await self.config.suspended():
+            await ctx.send("Suspended. Use `rrresume` first.")
+            return
+
+        last_name = await self.config.last_station_name()
+        last_url = await self.config.last_station_stream_url()
+
+        if not last_name or not last_url:
+            await ctx.send("No saved station to restore yet. Use `playstation` first.")
+            return
+
+        # Radio takes over; clear audio intent
+        await self._clear_audio_intent()
+
+        await self.config.stream_url.set(last_url)
+        await self.config.station_name.set(last_name)
+
+        ok = await self._audio_play(ctx, last_url)
+        if not ok:
+            return
+
+        await self._set_presence(f"📻 {last_name}")
+
+        embed = discord.Embed(
+            title="📻 Restored",
+            description=f"**Station:** {last_name}\n🔗 [Stream Link]({last_url})",
+            color=discord.Color.blurple(),
+        )
+        embed.set_footer(text="Grey Hair Asuka protocol: instant restore.")
         await ctx.send(embed=embed)
 
     @commands.is_owner()
@@ -1038,14 +1081,56 @@ class RedRadio(commands.Cog):
     async def stopstation(self, ctx: commands.Context):
         if not await self._require_owner_in_allowed_vc(ctx):
             return
-        if not await self._require_bot_home(ctx):
-            return
-
-        ok = await self._audio_stop(ctx)
-        if not ok:
-            return
-
-        await self._clear_state()
-        await self._set_presence_station(None)
-
+        await self._audio_stop(ctx)
+        await self._clear_radio_state()
+        await self._set_presence(None)
         await ctx.send(embed=discord.Embed(title="⏹️ Stopped", description="Radio stream stopped.", color=discord.Color.red()))
+
+    # -------------------------
+    # DJ command: request radio back (notify Grey Hair Asuka)
+    # -------------------------
+    @commands.guild_only()
+    @commands.command()
+    async def djradio(self, ctx: commands.Context, *, note: str = ""):
+        if not ctx.guild:
+            return
+
+        allowed_guild_id = await self.config.allowed_guild_id()
+        if allowed_guild_id and ctx.guild.id != int(allowed_guild_id):
+            return
+
+        dj_user_id = await self.config.dj_user_id()
+        if not dj_user_id or ctx.author.id != int(dj_user_id):
+            return  # silent fail by design
+
+        control = await self._control_channel(ctx.guild)
+        if not control:
+            return
+
+        owner_id = await self.config.bound_owner_user_id()
+        owner_mention = f"<@{int(owner_id)}>" if owner_id else "@owner"
+
+        last_station = await self.config.last_station_name()
+        last_line = f"Last station saved: **{last_station}**" if last_station else "No saved station on record."
+
+        note = (note or "").strip()
+        note_line = f"\n**DJ note:** {note}" if note else ""
+
+        embed = discord.Embed(
+            title="📻 DJ Asuka requested the radio back",
+            description=f"{owner_mention}\n{last_line}{note_line}\n\nSuggested action: `g!rrrestore`",
+            color=discord.Color.dark_teal(),
+        )
+        embed.set_footer(text="Grey Hair Asuka protocol: restore stability.")
+        await control.send(embed=embed)
+
+        confirm = discord.Embed(
+            title="🖤 Okay.",
+            description="I told Grey Hair Asuka you want the radio back.",
+            color=discord.Color.dark_teal(),
+        )
+        await ctx.send(embed=confirm)
+
+
+async def setup(bot):
+    await bot.add_cog(UnifiedAudioRadio(bot))
