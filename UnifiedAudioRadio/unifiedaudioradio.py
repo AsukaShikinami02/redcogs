@@ -81,7 +81,11 @@ class UnifiedAudioRadio(commands.Cog):
     - Notify DJ when YouTube starts
     - Notify DJ when YouTube stops
     - DJ can request radio back via g!djradio (notifies Grey Hair Asuka)
-    - NEW: g!rrrestore instantly restores the last saved station
+    - g!rrrestore instantly restores the last saved station
+    - NEW: panic recovery + status:
+        - g!rrstatus
+        - g!rrunlock [home|restore|full]
+        - g!rrpanic, g!rrsuspend, g!rrresume, g!rrhard
     """
 
     AUDIO_SUMMON_ALIASES: Set[str] = {"summon", "join", "connect"}
@@ -596,13 +600,14 @@ class UnifiedAudioRadio(commands.Cog):
                         await self.config.audio_intent_started_monotonic.set(float(time.monotonic()))
                         await self._dj_youtube_started(ctx.guild)
 
-                # STOP/DISCONNECT: stop notifications + clear states
+                # STOP: stop notifications + clear states
                 if name in self.AUDIO_STOP_ALIASES:
                     await self._clear_radio_state()
                     await self._clear_audio_intent()
                     await self._set_presence(None)
                     await self._dj_youtube_stopped(ctx.guild)
 
+                # DISCONNECT: clear + grace windows
                 if name in self.AUDIO_DISCONNECT_ALIASES:
                     await self._clear_radio_state()
                     await self._clear_audio_intent()
@@ -780,7 +785,9 @@ class UnifiedAudioRadio(commands.Cog):
         blob = f"{station.tags} {station.name}".lower()
         return any(t and t in blob for t in blocked_tags)
 
-    def _page_embed(self, ctx: commands.Context, query: str, page: int, total_pages: int, page_items: List[Station]) -> discord.Embed:
+    def _page_embed(
+        self, ctx: commands.Context, query: str, page: int, total_pages: int, page_items: List[Station]
+    ) -> discord.Embed:
         prefix = ctx.clean_prefix
         embed = discord.Embed(
             title=f"🔎 Results for '{query}' (Page {page + 1}/{total_pages})",
@@ -798,6 +805,305 @@ class UnifiedAudioRadio(commands.Cog):
             )
         embed.set_footer(text=f"Owner-only. Use {prefix}playstation <number>.")
         return embed
+
+    # -------------------------
+    # Panic / Status helpers + commands
+    # -------------------------
+    def _fmt_yesno(self, b: bool) -> str:
+        return "✅ Yes" if b else "❌ No"
+
+    def _fmt_id(self, x: Optional[int]) -> str:
+        return str(x) if x else "—"
+
+    def _fmt_secs(self, seconds: float) -> str:
+        seconds = max(0.0, float(seconds))
+        m = int(seconds // 60)
+        s = int(seconds % 60)
+        if m <= 0:
+            return f"{s}s"
+        return f"{m}m {s}s"
+
+    @commands.is_owner()
+    @commands.command()
+    async def rrstatus(self, ctx: commands.Context):
+        """Show current safety state (panic/suspended), binding, channels, and media state."""
+        if ctx.guild is None:
+            return
+
+        bound = await self.config.bound()
+        allowed_guild_id = await self.config.allowed_guild_id()
+        control_id = await self.config.control_text_channel_id()
+        allowed_vc_id = await self.config.allowed_voice_channel_id()
+        audit_id = await self.config.audit_channel_id()
+        bound_owner_id = await self.config.bound_owner_user_id()
+
+        panic = await self.config.panic_locked()
+        autopanic_enabled = await self.config.autopanic_enabled()
+        autopanic_reason = await self.config.autopanic_reason()
+
+        suspended = await self.config.suspended()
+        suspend_reason = await self.config.suspend_reason()
+        hard = await self.config.hard_mode()
+
+        radio_active = await self._radio_active()
+        station_name = await self.config.station_name()
+        stream_url = await self.config.stream_url()
+        last_station = await self.config.last_station_name()
+        last_station_url = await self.config.last_station_stream_url()
+
+        audio_intent = await self.config.audio_intent_active()
+        audio_intent_started = float(await self.config.audio_intent_started_monotonic() or 0.0)
+
+        vc = ctx.guild.voice_client
+        vc_connected = self._vc_connected(vc)
+        vc_channel_id = self._vc_channel_id(vc)
+        bot_home = await self._bot_is_home(ctx.guild)
+        player_playing = self._player_is_playing(ctx.guild)
+
+        now = time.monotonic()
+        intent_age = self._fmt_secs(now - audio_intent_started) if (audio_intent and audio_intent_started) else "—"
+
+        control_ch = ctx.guild.get_channel(int(control_id)) if control_id else None
+        audit_ch = ctx.guild.get_channel(int(audit_id)) if audit_id else None
+        allowed_vc = ctx.guild.get_channel(int(allowed_vc_id)) if allowed_vc_id else None
+        bot_vc = ctx.guild.get_channel(int(vc_channel_id)) if vc_channel_id else None
+
+        embed = discord.Embed(
+            title="🛡️ Unified Audio/Radio Status",
+            color=discord.Color.dark_teal() if not panic else discord.Color.red(),
+        )
+
+        embed.add_field(
+            name="Binding / Perimeter",
+            value=(
+                f"**Bound:** {self._fmt_yesno(bool(bound))}\n"
+                f"**Allowed Guild:** {self._fmt_id(int(allowed_guild_id) if allowed_guild_id else None)}\n"
+                f"**Control Channel:** {control_ch.mention if isinstance(control_ch, discord.TextChannel) else self._fmt_id(int(control_id) if control_id else None)}\n"
+                f"**Locked VC:** {allowed_vc.mention if allowed_vc else self._fmt_id(int(allowed_vc_id) if allowed_vc_id else None)}\n"
+                f"**Audit Channel:** {audit_ch.mention if isinstance(audit_ch, discord.TextChannel) else self._fmt_id(int(audit_id) if audit_id else None)}\n"
+                f"**Bound Owner ID:** {self._fmt_id(int(bound_owner_id) if bound_owner_id else None)}"
+            ),
+            inline=False,
+        )
+
+        embed.add_field(
+            name="Safety State",
+            value=(
+                f"**Panic Locked:** {self._fmt_yesno(bool(panic))}\n"
+                f"**AutoPanic Enabled:** {self._fmt_yesno(bool(autopanic_enabled))}\n"
+                f"**AutoPanic Reason:** {autopanic_reason or '—'}\n"
+                f"**Suspended:** {self._fmt_yesno(bool(suspended))}\n"
+                f"**Suspend Reason:** {suspend_reason or '—'}\n"
+                f"**Hard Mode:** {self._fmt_yesno(bool(hard))}"
+            ),
+            inline=False,
+        )
+
+        embed.add_field(
+            name="Bot Voice / Playback",
+            value=(
+                f"**VC Connected:** {self._fmt_yesno(bool(vc_connected))}\n"
+                f"**Bot VC:** {bot_vc.mention if bot_vc else (self._fmt_id(int(vc_channel_id)) if vc_channel_id else '—')}\n"
+                f"**Bot Is Home:** {self._fmt_yesno(bool(bot_home))}\n"
+                f"**Player Is Playing (Audio):** {self._fmt_yesno(bool(player_playing))}\n"
+                f"**Audio Intent Active:** {self._fmt_yesno(bool(audio_intent))}\n"
+                f"**Audio Intent Age:** {intent_age}"
+            ),
+            inline=False,
+        )
+
+        embed.add_field(
+            name="Radio State",
+            value=(
+                f"**Radio Active (saved):** {self._fmt_yesno(bool(radio_active))}\n"
+                f"**Station:** {station_name or '—'}\n"
+                f"**Stream URL:** {stream_url or '—'}\n"
+                f"**Last Station:** {last_station or '—'}\n"
+                f"**Last URL:** {last_station_url or '—'}"
+            ),
+            inline=False,
+        )
+
+        embed.set_footer(text="Commands: rrstatus | rrunlock [home|restore|full] | rrpanic | rrsuspend | rrresume | rrhard")
+        await ctx.send(embed=embed)
+
+    @commands.is_owner()
+    @commands.command()
+    async def rrpanic(self, ctx: commands.Context, *, reason: str = "Manual panic engaged"):
+        """Manually engage panic: disconnect, clear state, lock commands."""
+        if ctx.guild is None:
+            return
+        if not await self.config.bound():
+            await ctx.send("Not bound yet. Use `rrbind` first.")
+            return
+
+        await self.config.panic_locked.set(True)
+        await self.config.autopanic_reason.set(reason)
+
+        try:
+            await self._vc_disconnect(ctx.guild.voice_client)
+        except Exception:
+            pass
+
+        await self._clear_radio_state()
+        await self._clear_audio_intent()
+        await self._set_presence(None)
+
+        await self._audit_security(ctx.guild, f"Manual panic: {reason}")
+        await self._notify_control(
+            ctx.guild,
+            "🛑 Panic Engaged (Manual)",
+            f"{reason}\n\nUse `rrunlock` in the control channel (while you’re in the locked VC).",
+            discord.Color.red(),
+        )
+        await ctx.send("Panic engaged.")
+
+    @commands.is_owner()
+    @commands.command()
+    async def rrsuspend(self, ctx: commands.Context, *, reason: str = "Manual suspend"):
+        """Soft-stop: blocks playback actions until rrresume (does not lock like panic)."""
+        if ctx.guild is None:
+            return
+        if not await self.config.bound():
+            await ctx.send("Not bound yet. Use `rrbind` first.")
+            return
+        if not await self._require_owner_in_allowed_vc(ctx):
+            return
+
+        await self._suspend(reason)
+
+        # Optional: disconnect + clear media so the world is quiet and stable.
+        try:
+            await self._vc_disconnect(ctx.guild.voice_client)
+        except Exception:
+            pass
+        await self._clear_radio_state()
+        await self._clear_audio_intent()
+
+        await self._notify_control(
+            ctx.guild,
+            "🟡 Suspended",
+            f"{reason}\n\nUse `rrresume` (in control channel, in locked VC) to continue.",
+            discord.Color.gold(),
+        )
+        await ctx.send("Suspended.")
+
+    @commands.is_owner()
+    @commands.command()
+    async def rrresume(self, ctx: commands.Context):
+        """Resume after suspension (requires owner in locked VC)."""
+        if ctx.guild is None:
+            return
+        if not await self.config.bound():
+            await ctx.send("Not bound yet. Use `rrbind` first.")
+            return
+        if not await self._require_owner_in_allowed_vc(ctx):
+            return
+
+        await self._unsuspend()
+        await ctx.send("Resumed. Use `rrhome` if you need to bring her back home.")
+
+    @commands.is_owner()
+    @commands.command()
+    async def rrhard(self, ctx: commands.Context, mode: Optional[str] = None):
+        """
+        Toggle hard mode:
+        - hard: autopanic on perimeter violation
+        - soft: suspend on perimeter violation
+        """
+        if mode is None:
+            cur = bool(await self.config.hard_mode())
+            await ctx.send(f"Hard mode is currently: **{cur}**. Use `rrhard on` or `rrhard off`.")
+            return
+
+        m = (mode or "").strip().lower()
+        if m in ("on", "true", "1", "hard"):
+            await self.config.hard_mode.set(True)
+            await ctx.send("Hard mode: **ON** (violations trigger panic).")
+        elif m in ("off", "false", "0", "soft"):
+            await self.config.hard_mode.set(False)
+            await ctx.send("Hard mode: **OFF** (violations trigger suspend).")
+        else:
+            await ctx.send("Use `rrhard on` or `rrhard off`.")
+
+    @commands.is_owner()
+    @commands.command()
+    async def rrunlock(self, ctx: commands.Context, mode: Optional[str] = None):
+        """
+        Recover from panic lock.
+
+        Modes:
+        - (none)   : just clears panic lock
+        - home     : clears panic + summons bot to locked VC
+        - restore  : clears panic + summons home + restores last station
+        - full     : same as restore
+        """
+        if ctx.guild is None:
+            return
+        if not await self.config.bound():
+            await ctx.send("Not bound yet. Use `rrbind` first.")
+            return
+
+        # Only unlock if owner is in the locked VC (prevents hostile unlocks).
+        if not await self._require_owner_in_allowed_vc(ctx):
+            return
+
+        # Clear panic + reasons
+        await self.config.panic_locked.set(False)
+        await self.config.autopanic_reason.set(None)
+
+        # Panic recovery should fully reset posture
+        await self._unsuspend()
+
+        # Clear internal flags (prevents "panic still active" / stale-state confusion)
+        await self._clear_radio_state()
+        await self._clear_audio_intent()
+        await self._set_presence(None)
+
+        m = (mode or "").strip().lower()
+        do_home = m in ("home", "restore", "full")
+        do_restore = m in ("restore", "full")
+
+        if do_home:
+            now = time.monotonic()
+            self._allow_summon_until = now + SUMMON_GRACE_SECONDS
+            self._home_grace_until = now + HOME_GRACE_SECONDS
+
+            ok = await self._audio_summon(ctx)
+            if not ok:
+                await ctx.send("Unlocked, but summon failed. Try `rrhome`.")
+                return
+
+        if do_restore:
+            last_name = await self.config.last_station_name()
+            last_url = await self.config.last_station_stream_url()
+
+            if last_name and last_url:
+                await self._clear_audio_intent()
+                await self.config.stream_url.set(last_url)
+                await self.config.station_name.set(last_name)
+
+                ok = await self._audio_play(ctx, last_url)
+                if ok:
+                    await self._set_presence(f"📻 {last_name}")
+            else:
+                await ctx.send("Unlocked + home, but no saved station exists yet (nothing to restore).")
+
+        await self._notify_control(
+            ctx.guild,
+            "✅ Panic Cleared",
+            f"Panic lock cleared by {ctx.author.mention}."
+            + ("\nHome: **YES**" if do_home else "\nHome: **NO**")
+            + ("\nRestore attempted: **YES**" if do_restore else "\nRestore attempted: **NO**"),
+            discord.Color.green(),
+        )
+
+        if do_restore:
+            await ctx.send("Unlocked. Home restored (and station restore attempted).")
+        elif do_home:
+            await ctx.send("Unlocked. She’s coming home.")
+        else:
+            await ctx.send("Unlocked. Panic is cleared.")
 
     # -------------------------
     # Owner commands (bind/control/home/radio)
@@ -1033,7 +1339,6 @@ class UnifiedAudioRadio(commands.Cog):
         embed.set_footer(text="No track titles. Station name only.")
         await ctx.send(embed=embed)
 
-    # ✅ NEW: one-shot restore (no index, no search cache needed)
     @commands.is_owner()
     @commands.command()
     async def rrrestore(self, ctx: commands.Context):
@@ -1048,6 +1353,9 @@ class UnifiedAudioRadio(commands.Cog):
         if await self.config.suspended():
             await ctx.send("Suspended. Use `rrresume` first.")
             return
+        if await self.config.panic_locked():
+            await ctx.send("Panic lock is active. Use `rrunlock restore`.")
+            return
 
         last_name = await self.config.last_station_name()
         last_url = await self.config.last_station_stream_url()
@@ -1056,7 +1364,6 @@ class UnifiedAudioRadio(commands.Cog):
             await ctx.send("No saved station to restore yet. Use `playstation` first.")
             return
 
-        # Radio takes over; clear audio intent
         await self._clear_audio_intent()
 
         await self.config.stream_url.set(last_url)
@@ -1118,7 +1425,7 @@ class UnifiedAudioRadio(commands.Cog):
 
         embed = discord.Embed(
             title="📻 DJ Asuka requested the radio back",
-            description=f"{owner_mention}\n{last_line}{note_line}\n\nSuggested action: `g!rrrestore`",
+            description=f"{owner_mention}\n{last_line}{note_line}\n\nSuggested action: `g!rrrestore` (or `g!rrunlock restore` if panic)",
             color=discord.Color.dark_teal(),
         )
         embed.set_footer(text="Grey Hair Asuka protocol: restore stability.")
