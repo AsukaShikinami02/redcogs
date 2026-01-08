@@ -7,7 +7,7 @@
     "install_msg": "Thanks for installing Radio, I hope it comes in handy",
     "max_bot_version": "0.0.0",
     "min_bot_version": "3.3.10",
-    "name": "MediaGuard",
+    "name": "UnifiedAudioRadio",
     "permissions": [],
     "required_cogs": {},
     "requirements": [],
@@ -16,3 +16,4 @@
     "type": "COG"
 
   }
+
