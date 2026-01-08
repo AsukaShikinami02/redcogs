@@ -1491,11 +1491,14 @@ class UnifiedAudioRadio(commands.Cog):
         embed.set_footer(text="No track titles. Station name only.")
         await ctx.send(embed=embed)
 
-    # ✅ rrrestore = RADIO ONLY (as requested)
+       # ✅ rrrestore = RADIO ONLY + FORCE SWITCH (stop YouTube first)
     @commands.is_owner()
     @commands.command()
     async def rrrestore(self, ctx: commands.Context):
-        """Restore the last saved radio station (radio-only)."""
+        """
+        Restore the last saved radio station (radio-only),
+        and FORCE switch by stopping any current Audio playback (e.g., YouTube).
+        """
         if not await self._require_owner_in_allowed_vc(ctx):
             return
         if not await self._require_bot_home(ctx):
@@ -1509,13 +1512,22 @@ class UnifiedAudioRadio(commands.Cog):
 
         last_name = await self.config.last_station_name()
         last_url = await self.config.last_station_stream_url()
-
         if not last_name or not last_url:
             await ctx.send("No saved station to restore yet. Use `playstation` first.")
             return
 
-        await self._clear_audio_intent()
+        # --- FORCE SWITCH: stop whatever Audio is currently doing (YouTube/queue/etc.)
+        try:
+            await self._audio_stop(ctx)
+        except Exception:
+            pass
 
+        # Clear all media state so watchdog / gating stays consistent
+        await self._clear_audio_intent()
+        await self._clear_radio_state()
+        await self._set_presence(None)
+
+        # Set radio state and play it
         await self.config.stream_url.set(last_url)
         await self.config.station_name.set(last_name)
 
@@ -1527,11 +1539,15 @@ class UnifiedAudioRadio(commands.Cog):
 
         embed = discord.Embed(
             title="📻 Restored (Radio)",
-            description=f"**Station:** {last_name}\n🔗 [Stream Link]({last_url})",
+            description=(
+                "Stopped current playback and switched back to radio.\n"
+                f"**Station:** {last_name}\n🔗 [Stream Link]({last_url})"
+            ),
             color=discord.Color.blurple(),
         )
-        embed.set_footer(text="Grey Hair Asuka protocol: radio restore.")
+        embed.set_footer(text="Grey Hair Asuka protocol: force-switch to radio.")
         await ctx.send(embed=embed)
+
 
     @commands.is_owner()
     @commands.command()
