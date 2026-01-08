@@ -128,6 +128,68 @@ class RedRadio(commands.Cog):
         self._last_reassure_out_vc_ts: float = 0.0
 
     # -------------------------
+    # Voice abstraction (discord.py VoiceClient vs Red Audio Lavalink Player)
+    # -------------------------
+    def _vc_connected(self, vc) -> bool:
+        if vc is None:
+            return False
+
+        # discord.py: method
+        meth = getattr(vc, "is_connected", None)
+        if callable(meth):
+            try:
+                return bool(meth())
+            except Exception:
+                return False
+
+        # Lavalink-ish: boolean
+        val = getattr(vc, "connected", None)
+        if isinstance(val, bool):
+            return val
+
+        # Some impls: boolean is_connected
+        val2 = getattr(vc, "is_connected", None)
+        if isinstance(val2, bool):
+            return val2
+
+        return False
+
+    def _vc_channel_id(self, vc) -> Optional[int]:
+        if vc is None:
+            return None
+
+        # discord.py: vc.channel is a channel object
+        ch = getattr(vc, "channel", None)
+        if ch is not None and hasattr(ch, "id"):
+            try:
+                return int(ch.id)
+            except Exception:
+                pass
+
+        # Lavalink-ish: id fields
+        for attr in ("channel_id", "voice_channel_id"):
+            v = getattr(vc, attr, None)
+            if isinstance(v, int):
+                return v
+            if isinstance(v, str) and v.isdigit():
+                return int(v)
+
+        return None
+
+    async def _vc_disconnect(self, vc) -> None:
+        if vc is None:
+            return
+        disc = getattr(vc, "disconnect", None)
+        if callable(disc):
+            try:
+                await disc(force=True)
+                return
+            except TypeError:
+                await disc()
+            except Exception:
+                pass
+
+    # -------------------------
     # Lifecycle
     # -------------------------
     async def cog_load(self) -> None:
@@ -228,8 +290,13 @@ class RedRadio(commands.Cog):
         allowed_vc_id = await self.config.allowed_voice_channel_id()
         if not allowed_vc_id:
             return False
+
         vc = guild.voice_client
-        return bool(vc and vc.is_connected() and vc.channel and vc.channel.id == allowed_vc_id)
+        if not self._vc_connected(vc):
+            return False
+
+        cid = self._vc_channel_id(vc)
+        return bool(cid and int(cid) == int(allowed_vc_id))
 
     async def _require_bot_home(self, ctx: commands.Context) -> bool:
         if not ctx.guild:
@@ -241,12 +308,17 @@ class RedRadio(commands.Cog):
             return False
 
         vc = ctx.guild.voice_client
-        if not vc or not vc.is_connected() or not vc.channel:
+        if not self._vc_connected(vc):
             await ctx.send("Bot is not in voice. Use `rrhome` while you are in the locked VC.")
             return False
 
-        if vc.channel.id != allowed_vc_id:
-            await self._autopanic(ctx.guild, f"Control attempted while bot in wrong VC ({vc.channel.id})")
+        cid = self._vc_channel_id(vc)
+        if not cid:
+            await ctx.send("Voice state unknown. (No channel id)")
+            return False
+
+        if int(cid) != int(allowed_vc_id):
+            await self._autopanic(ctx.guild, f"Control attempted while bot in wrong VC ({cid})")
             await ctx.send("Bot is in the wrong voice channel. Auto-panic engaged.")
             return False
 
@@ -279,9 +351,7 @@ class RedRadio(commands.Cog):
             await self.config.autopanic_reason.set(reason)
 
             try:
-                vc = guild.voice_client
-                if vc and vc.is_connected():
-                    await vc.disconnect(force=True)
+                await self._vc_disconnect(guild.voice_client)
             except Exception:
                 pass
 
@@ -349,9 +419,11 @@ class RedRadio(commands.Cog):
                     continue
 
                 vc = guild.voice_client
-                if vc and vc.is_connected() and vc.channel and vc.channel.id != int(vc_id):
-                    await self._autopanic(guild, f"Watchdog: bot in wrong VC ({vc.channel.id})")
-                    continue
+                if self._vc_connected(vc):
+                    cid = self._vc_channel_id(vc)
+                    if cid and int(cid) != int(vc_id):
+                        await self._autopanic(guild, f"Watchdog: bot in wrong VC ({cid})")
+                        continue
 
             except asyncio.CancelledError:
                 break
@@ -559,7 +631,6 @@ class RedRadio(commands.Cog):
 
         await ctx.send("Bound. Use rrsetdj to set DJ Asuka. Use rrhome to bring her home.")
 
-    # ✅ NEW: move the bound control text channel
     @commands.is_owner()
     @commands.command()
     async def rrcontrol(self, ctx: commands.Context, channel: Optional[discord.TextChannel] = None):
@@ -581,14 +652,12 @@ class RedRadio(commands.Cog):
             await ctx.send("Wrong guild.")
             return
 
-        # Grey Hair Asuka paranoia: require owner in allowed VC to re-key the control room
         if not await self._require_owner_in_allowed_vc(ctx):
             return
 
         target = channel or ctx.channel
         await self.config.control_text_channel_id.set(target.id)
 
-        # If no explicit fallback is set, follow the control channel
         fallback = await self.config.reassure_fallback_channel_id()
         if not fallback:
             await self.config.reassure_fallback_channel_id.set(target.id)
@@ -656,8 +725,7 @@ class RedRadio(commands.Cog):
             pass
 
         try:
-            if ctx.guild and ctx.guild.voice_client and ctx.guild.voice_client.is_connected():
-                await ctx.guild.voice_client.disconnect(force=True)
+            await self._vc_disconnect(ctx.guild.voice_client if ctx.guild else None)
         except Exception:
             pass
 
