@@ -26,6 +26,9 @@ REASSURE_TICK = 10.0  # internal tick; sending is interval-gated
 # unlock recovery timing
 RECOVERY_DELAY_SEC = 0.8
 
+# watchdog grace while rrhome is summoning
+HOME_GRACE_SECONDS = 12.0
+
 
 @dataclass(frozen=True)
 class Station:
@@ -47,7 +50,6 @@ class Station:
             return None
 
         u = stream_url.lower()
-        # Fail-closed: only http(s), no localhost.
         if not (u.startswith("http://") or u.startswith("https://")):
             return None
         if (
@@ -65,22 +67,10 @@ class RedRadio(commands.Cog):
     """
     Grey Hair Asuka Approved Radio Cog (Red) + DJ Asuka reassurance (station-name only).
 
-    Perimeter:
-    - One guild, one control text channel, one allowed VC (set by rrbind)
-    - Owner-only for every command in this cog (enforced by cog_check + @is_owner)
-
-    Stability:
-    - Owner must be in the allowed VC to do any control action
-    - Bot must be "home" (in allowed VC) to search/play/stop stations
-    - rrhome is the ONLY allowed path to Audio summon
-      -> If Audio summon is used directly (even by owner), auto-panic (unless rrhome just authorized it)
-    - Unlock performs a recovery re-arm to avoid “looks playing but silent”.
-
-    DJ Asuka reassurance:
-    - If station is set and bot is home, periodically reassures DJ Asuka:
-        * IN-VC cadence (default 5 min)
-        * OUT-VC cadence (default 15 min)
-      Delivery: DM-first, fallback to a configured channel (or control channel)
+    Key fixes:
+    - Audio disconnect is treated as INTENTIONAL "suspend" (no panic)
+    - Watchdog will not panic if suspended=True
+    - rrhome clears suspension and safely re-arms audio
     """
 
     def __init__(self, bot):
@@ -93,27 +83,35 @@ class RedRadio(commands.Cog):
             stream_url=None,
             station_name=None,
             last_search_query=None,
+
             # perimeter
             allowed_guild_id=None,
             control_text_channel_id=None,
             allowed_voice_channel_id=None,
+
             # filters
             min_bitrate_kbps=64,
             block_tags_csv="phonk,earrape,nsfw",
+
             # security + ops
             audit_channel_id=None,
             bound=False,
             panic_locked=True,
             autopanic_enabled=True,
             autopanic_reason=None,
+
+            # NEW: intentional suspension (e.g., you used Audio disconnect)
+            suspended=False,
+
             # DJ Asuka identity
             dj_user_id=None,
+
             # periodic reassurance
             periodic_reassure_enabled=True,
-            reassure_interval_in_vc_sec=300,     # 5 minutes
-            reassure_interval_out_vc_sec=900,    # 15 minutes
+            reassure_interval_in_vc_sec=300,
+            reassure_interval_out_vc_sec=900,
             reassure_use_dm=True,
-            reassure_fallback_channel_id=None,   # if DMs fail/disabled; else control channel
+            reassure_fallback_channel_id=None,
         )
 
         self._stations_cache: List[Station] = []
@@ -124,10 +122,9 @@ class RedRadio(commands.Cog):
         self._watchdog_task: Optional[asyncio.Task] = None
         self._reassure_task: Optional[asyncio.Task] = None
 
-        # rrhome authorization window for Audio summon
         self._allow_summon_until: float = 0.0
+        self._home_grace_until: float = 0.0
 
-        # Rate limits for reassurance
         self._last_reassure_in_vc_ts: float = 0.0
         self._last_reassure_out_vc_ts: float = 0.0
 
@@ -138,7 +135,6 @@ class RedRadio(commands.Cog):
         if vc is None:
             return False
 
-        # discord.py: method
         meth = getattr(vc, "is_connected", None)
         if callable(meth):
             try:
@@ -146,12 +142,10 @@ class RedRadio(commands.Cog):
             except Exception:
                 return False
 
-        # Lavalink-ish: boolean
         val = getattr(vc, "connected", None)
         if isinstance(val, bool):
             return val
 
-        # Some impls: boolean is_connected
         val2 = getattr(vc, "is_connected", None)
         if isinstance(val2, bool):
             return val2
@@ -162,7 +156,6 @@ class RedRadio(commands.Cog):
         if vc is None:
             return None
 
-        # discord.py: vc.channel is a channel object
         ch = getattr(vc, "channel", None)
         if ch is not None and hasattr(ch, "id"):
             try:
@@ -170,7 +163,6 @@ class RedRadio(commands.Cog):
             except Exception:
                 pass
 
-        # Lavalink-ish: id fields
         for attr in ("channel_id", "voice_channel_id"):
             v = getattr(vc, attr, None)
             if isinstance(v, int):
@@ -194,9 +186,6 @@ class RedRadio(commands.Cog):
                 pass
 
     def _player_is_playing(self, guild: discord.Guild) -> bool:
-        """
-        Lavalink Player usually exposes .is_playing (bool) or is_playing().
-        """
         p = guild.voice_client
         v = getattr(p, "is_playing", None)
         if isinstance(v, bool):
@@ -226,7 +215,6 @@ class RedRadio(commands.Cog):
         for t in (self._watchdog_task, self._reassure_task):
             if t and not t.done():
                 t.cancel()
-
         if self.http and not self.http.closed:
             self.bot.loop.create_task(self._close_http())
 
@@ -265,7 +253,6 @@ class RedRadio(commands.Cog):
 
         cmd = (ctx.command.qualified_name if ctx.command else "").lower()
 
-        # Commands allowed before binding
         prebind_ok = {"rrbind", "rrstatus"}
         if not await self.config.bound():
             if cmd in prebind_ok:
@@ -278,9 +265,6 @@ class RedRadio(commands.Cog):
             await self._audit_security(ctx.guild, f"Denied: wrong guild ({ctx.guild.id})")
             return False
 
-        # Grey Hair Asuka emergency / re-key commands:
-        # - Allowed even during panic
-        # - Allowed outside the control channel (so you can move the control channel)
         bypass_control_channel = {"rrcontrol", "rrstatus", "rrpanic", "rrunlock"}
 
         control_text_channel_id = await self.config.control_text_channel_id()
@@ -290,7 +274,6 @@ class RedRadio(commands.Cog):
                 return False
 
         if await self.config.panic_locked():
-            # While panicked, only allow these commands.
             panic_ok = {"rrstatus", "rrunlock", "rrpanic", "rrcontrol"}
             if cmd in panic_ok:
                 return True
@@ -385,12 +368,11 @@ class RedRadio(commands.Cog):
             except Exception:
                 pass
 
-            # IMPORTANT: keep station info so unlock can recover audio without lying
             await self._set_presence_station(None)
             await self._audit_security(guild, f"Auto-panic: {reason}")
 
     # -------------------------
-    # Tripwire: rrhome is only summon path
+    # Tripwire: rrhome is only summon path + detect Audio disconnect => suspend
     # -------------------------
     @commands.Cog.listener()
     async def on_command(self, ctx: commands.Context):
@@ -404,9 +386,20 @@ class RedRadio(commands.Cog):
             if allowed_guild_id and ctx.guild.id != allowed_guild_id:
                 return
 
-            if ctx.command.name != "summon":
+            cog = (ctx.command.cog_name or "").lower()
+            name = (ctx.command.name or "").lower()
+
+            # If you used Audio's disconnect, treat as intentional suspend (no panic)
+            if cog == "audio" and name in {"disconnect"}:
+                if await self.config.stream_url():
+                    await self.config.suspended.set(True)
+                    await self._set_presence_station(None)
                 return
-            if not ctx.command.cog_name or ctx.command.cog_name.lower() != "audio":
+
+            # rrhome is the only allowed summon path
+            if name != "summon":
+                return
+            if cog != "audio":
                 return
 
             if time.monotonic() <= self._allow_summon_until:
@@ -429,6 +422,10 @@ class RedRadio(commands.Cog):
                 if not await self.config.bound():
                     continue
 
+                # Grace while rrhome is moving
+                if time.monotonic() <= self._home_grace_until:
+                    continue
+
                 guild_id = await self.config.allowed_guild_id()
                 vc_id = await self.config.allowed_voice_channel_id()
                 if not guild_id or not vc_id:
@@ -443,8 +440,10 @@ class RedRadio(commands.Cog):
 
                 stream_url = await self.config.stream_url()
                 home = await self._bot_is_home(guild)
+                suspended = await self.config.suspended()
 
-                if stream_url and not home:
+                # If intentionally suspended, do NOT panic just because we aren't home.
+                if stream_url and not home and not suspended:
                     await self._autopanic(guild, "Watchdog: station set but bot is not home")
                     continue
 
@@ -502,6 +501,10 @@ class RedRadio(commands.Cog):
                 if not await self.config.periodic_reassure_enabled():
                     continue
 
+                # If you intentionally suspended (audio disconnect), don't reassure as "home".
+                if await self.config.suspended():
+                    continue
+
                 guild_id = await self.config.allowed_guild_id()
                 allowed_vc_id = await self.config.allowed_voice_channel_id()
                 dj_user_id = await self.config.dj_user_id()
@@ -517,7 +520,6 @@ class RedRadio(commands.Cog):
                 if not guild:
                     continue
 
-                # Bot must be home (stability signal)
                 if not await self._bot_is_home(guild):
                     continue
 
@@ -613,15 +615,11 @@ class RedRadio(commands.Cog):
         return True
 
     async def _clear_state(self) -> None:
-        # Only used by stopstation / manual hard reset.
         await self.config.stream_url.set(None)
         await self.config.station_name.set(None)
+        await self.config.suspended.set(False)
 
     async def _requeue_station_if_needed(self, ctx: commands.Context) -> None:
-        """
-        If station is set but player isn't actually playing (common after panic),
-        re-arm the stream so we don't lie about playback.
-        """
         if not ctx.guild:
             return
 
@@ -630,12 +628,10 @@ class RedRadio(commands.Cog):
         if not stream_url or not station_name:
             return
 
-        # If player says it's playing, trust it.
         if self._player_is_playing(ctx.guild):
             await self._set_presence_station(station_name)
             return
 
-        # Hard reset and re-queue
         try:
             await self._audio_stop(ctx)
         except Exception:
@@ -694,21 +690,15 @@ class RedRadio(commands.Cog):
         await self.config.panic_locked.set(False)
         await self.config.autopanic_enabled.set(True)
         await self.config.autopanic_reason.set(None)
+        await self.config.suspended.set(False)
 
         await ctx.send("Bound. Use rrsetdj to set DJ Asuka. Use rrhome to bring her home.")
 
     @commands.is_owner()
     @commands.command()
     async def rrcontrol(self, ctx: commands.Context, channel: Optional[discord.TextChannel] = None):
-        """
-        Move the bound control text channel.
-        Usage:
-          g!rrcontrol            -> set control channel to the channel you ran this in
-          g!rrcontrol #channel   -> set control channel to #channel
-        """
         if ctx.guild is None:
             return
-
         if not await self.config.bound():
             await ctx.send(f"Not bound yet. Use `{ctx.clean_prefix}rrbind` first.")
             return
@@ -718,7 +708,6 @@ class RedRadio(commands.Cog):
             await ctx.send("Wrong guild.")
             return
 
-        # Grey Hair Asuka paranoia: require owner in allowed VC to re-key the control room
         if not await self._require_owner_in_allowed_vc(ctx):
             return
 
@@ -728,12 +717,10 @@ class RedRadio(commands.Cog):
         target = channel or ctx.channel
         await self.config.control_text_channel_id.set(target.id)
 
-        # If no explicit fallback is set, follow the control channel
         fallback = await self.config.reassure_fallback_channel_id()
         if not fallback:
             await self.config.reassure_fallback_channel_id.set(target.id)
 
-        # Audit-friendly confirmation embed
         embed = discord.Embed(
             title="🛡️ Control Channel Re-Keyed",
             description="Control channel has been moved.",
@@ -744,7 +731,6 @@ class RedRadio(commands.Cog):
         embed.set_footer(text="Grey Hair Asuka protocol: re-key control room.")
         await ctx.send(embed=embed)
 
-        # Optional: also send to audit channel if configured
         try:
             audit_id = await self.config.audit_channel_id()
             if audit_id:
@@ -771,6 +757,7 @@ class RedRadio(commands.Cog):
         outv = await self.config.reassure_interval_out_vc_sec()
         dm = await self.config.reassure_use_dm()
         fb = await self.config.reassure_fallback_channel_id()
+        suspended = await self.config.suspended()
 
         home = await self._bot_is_home(ctx.guild) if ctx.guild else False
         playing = self._player_is_playing(ctx.guild) if ctx.guild else False
@@ -779,6 +766,7 @@ class RedRadio(commands.Cog):
             f"**Bound:** {bound}",
             f"**Panic:** {panic}",
             f"**Reason:** {reason}" if reason else "",
+            f"**Suspended:** {suspended}",
             f"**Home:** {home}",
             f"**Player playing:** {playing}",
             "",
@@ -821,7 +809,7 @@ class RedRadio(commands.Cog):
         except Exception:
             pass
 
-        # Keep station info; unlock can recover it.
+        # keep station info; unlock can recover it
         await self._set_presence_station(None)
         await ctx.send("🛑 Panic engaged. Controls locked.")
 
@@ -835,10 +823,7 @@ class RedRadio(commands.Cog):
         await self.config.autopanic_reason.set(None)
         await ctx.send("Controls unlocked. Re-stabilizing…")
 
-        # Bring bot home first
         await self.rrhome(ctx)
-
-        # If station is set but audio is silent, re-arm it.
         await self._requeue_station_if_needed(ctx)
 
     @commands.is_owner()
@@ -876,9 +861,6 @@ class RedRadio(commands.Cog):
     @commands.is_owner()
     @commands.command()
     async def rrreassurechannel(self, ctx: commands.Context, channel: Optional[discord.TextChannel] = None):
-        """
-        Set where reassurance goes if DMs fail/disabled. Defaults to control channel if unset.
-        """
         if channel is None:
             await self.config.reassure_fallback_channel_id.set(None)
             await ctx.send("Reassurance fallback channel cleared (will use control channel).")
@@ -896,6 +878,10 @@ class RedRadio(commands.Cog):
             return
 
         if ctx.guild and await self._bot_is_home(ctx.guild):
+            # If we were intentionally suspended, clear it and (optionally) re-arm audio.
+            if await self.config.suspended():
+                await self.config.suspended.set(False)
+                await self._requeue_station_if_needed(ctx)
             await ctx.send("She’s already home.")
             return
 
@@ -904,8 +890,19 @@ class RedRadio(commands.Cog):
             await ctx.send("Audio `summon` command not found.")
             return
 
-        self._allow_summon_until = time.monotonic() + SUMMON_GRACE_SECONDS
+        # Grace windows (tripwire + watchdog)
+        now = time.monotonic()
+        self._allow_summon_until = now + SUMMON_GRACE_SECONDS
+        self._home_grace_until = now + HOME_GRACE_SECONDS
+
+        # Coming home clears intentional suspend
+        await self.config.suspended.set(False)
+
         await ctx.invoke(summon_cmd)
+
+        # Re-arm stream if it was set
+        await self._requeue_station_if_needed(ctx)
+
         await ctx.send("Home command executed.")
 
     @commands.is_owner()
@@ -1021,6 +1018,7 @@ class RedRadio(commands.Cog):
 
         await self.config.stream_url.set(station.stream_url)
         await self.config.station_name.set(station.name)
+        await self.config.suspended.set(False)
 
         ok = await self._audio_play(ctx, station.stream_url)
         if not ok:
