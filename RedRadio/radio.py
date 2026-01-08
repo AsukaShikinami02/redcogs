@@ -23,6 +23,9 @@ SUMMON_GRACE_SECONDS = 6.0
 
 REASSURE_TICK = 10.0  # internal tick; sending is interval-gated
 
+# unlock recovery timing
+RECOVERY_DELAY_SEC = 0.8
+
 
 @dataclass(frozen=True)
 class Station:
@@ -60,7 +63,7 @@ class Station:
 
 class RedRadio(commands.Cog):
     """
-    Grey Hair Asuka Approved Radio Cog (Red) + DJ Asuka reassurance:
+    Grey Hair Asuka Approved Radio Cog (Red) + DJ Asuka reassurance (station-name only).
 
     Perimeter:
     - One guild, one control text channel, one allowed VC (set by rrbind)
@@ -71,6 +74,7 @@ class RedRadio(commands.Cog):
     - Bot must be "home" (in allowed VC) to search/play/stop stations
     - rrhome is the ONLY allowed path to Audio summon
       -> If Audio summon is used directly (even by owner), auto-panic (unless rrhome just authorized it)
+    - Unlock performs a recovery re-arm to avoid “looks playing but silent”.
 
     DJ Asuka reassurance:
     - If station is set and bot is home, periodically reassures DJ Asuka:
@@ -188,6 +192,21 @@ class RedRadio(commands.Cog):
                 await disc()
             except Exception:
                 pass
+
+    def _player_is_playing(self, guild: discord.Guild) -> bool:
+        """
+        Lavalink Player usually exposes .is_playing (bool) or is_playing().
+        """
+        p = guild.voice_client
+        v = getattr(p, "is_playing", None)
+        if isinstance(v, bool):
+            return v
+        if callable(v):
+            try:
+                return bool(v())
+            except Exception:
+                return False
+        return False
 
     # -------------------------
     # Lifecycle
@@ -355,7 +374,7 @@ class RedRadio(commands.Cog):
             except Exception:
                 pass
 
-            await self._clear_state()
+            # IMPORTANT: keep station info so unlock can recover audio without lying
             await self._set_presence_station(None)
             await self._audit_security(guild, f"Auto-panic: {reason}")
 
@@ -425,6 +444,9 @@ class RedRadio(commands.Cog):
                         await self._autopanic(guild, f"Watchdog: bot in wrong VC ({cid})")
                         continue
 
+                # If station is set and bot is home but player isn't playing, don't autopanic:
+                # unlock recovery handles it. (Grey Hair Asuka = deliberate, not panicky.)
+
             except asyncio.CancelledError:
                 break
             except Exception:
@@ -487,6 +509,7 @@ class RedRadio(commands.Cog):
                 if not guild:
                     continue
 
+                # Bot must be home (stability signal)
                 if not await self._bot_is_home(guild):
                     continue
 
@@ -582,8 +605,43 @@ class RedRadio(commands.Cog):
         return True
 
     async def _clear_state(self) -> None:
+        # Only used by stopstation / manual hard reset.
         await self.config.stream_url.set(None)
         await self.config.station_name.set(None)
+
+    async def _requeue_station_if_needed(self, ctx: commands.Context) -> None:
+        """
+        If station is set but player isn't actually playing (common after panic),
+        re-arm the stream so we don't lie about playback.
+        """
+        if not ctx.guild:
+            return
+
+        stream_url = await self.config.stream_url()
+        station_name = await self.config.station_name()
+        if not stream_url or not station_name:
+            return
+
+        # If player says it's playing, trust it.
+        if self._player_is_playing(ctx.guild):
+            await self._set_presence_station(station_name)
+            return
+
+        # Hard reset and re-queue
+        try:
+            await self._audio_stop(ctx)
+        except Exception:
+            pass
+
+        await asyncio.sleep(RECOVERY_DELAY_SEC)
+
+        ok = await self._audio_play(ctx, stream_url)
+        if ok:
+            await self._set_presence_station(station_name)
+            try:
+                await ctx.send(f"🔁 Re-armed stream: **{station_name}**")
+            except Exception:
+                pass
 
     def _blocked_by_tags(self, station: Station, blocked_tags: List[str]) -> bool:
         blob = f"{station.tags} {station.name}".lower()
@@ -683,12 +741,14 @@ class RedRadio(commands.Cog):
         fb = await self.config.reassure_fallback_channel_id()
 
         home = await self._bot_is_home(ctx.guild) if ctx.guild else False
+        playing = self._player_is_playing(ctx.guild) if ctx.guild else False
 
         desc = [
             f"**Bound:** {bound}",
             f"**Panic:** {panic}",
             f"**Reason:** {reason}" if reason else "",
             f"**Home:** {home}",
+            f"**Player playing:** {playing}",
             "",
             f"**Allowed Guild:** `{g}`" if g else "",
             f"**Control Channel:** `{t}`" if t else "",
@@ -729,7 +789,7 @@ class RedRadio(commands.Cog):
         except Exception:
             pass
 
-        await self._clear_state()
+        # Keep station info; unlock can recover it.
         await self._set_presence_station(None)
         await ctx.send("🛑 Panic engaged. Controls locked.")
 
@@ -741,9 +801,13 @@ class RedRadio(commands.Cog):
 
         await self.config.panic_locked.set(False)
         await self.config.autopanic_reason.set(None)
-        await ctx.send("Controls unlocked.")
+        await ctx.send("Controls unlocked. Re-stabilizing…")
 
+        # Bring bot home first
         await self.rrhome(ctx)
+
+        # If station is set but audio is silent, re-arm it.
+        await self._requeue_station_if_needed(ctx)
 
     @commands.is_owner()
     @commands.command()
