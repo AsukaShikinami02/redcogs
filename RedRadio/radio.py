@@ -142,12 +142,10 @@ class RedRadio(commands.Cog):
             self._reassure_task = self.bot.loop.create_task(self._periodic_reassurance_loop())
 
     def cog_unload(self):
-        # Cancel loops
         for t in (self._watchdog_task, self._reassure_task):
             if t and not t.done():
                 t.cancel()
 
-        # Close http safely
         if self.http and not self.http.closed:
             self.bot.loop.create_task(self._close_http())
 
@@ -280,7 +278,6 @@ class RedRadio(commands.Cog):
             await self.config.panic_locked.set(True)
             await self.config.autopanic_reason.set(reason)
 
-            # Disconnect from VC
             try:
                 vc = guild.voice_client
                 if vc and vc.is_connected():
@@ -293,14 +290,10 @@ class RedRadio(commands.Cog):
             await self._audit_security(guild, f"Auto-panic: {reason}")
 
     # -------------------------
-    # Tripwires
+    # Tripwire: rrhome is only summon path
     # -------------------------
     @commands.Cog.listener()
     async def on_command(self, ctx: commands.Context):
-        """
-        rrhome is the only approved path to Audio summon.
-        If Audio summon is invoked directly (even by owner), auto-panic unless rrhome authorized it very recently.
-        """
         try:
             if not ctx.guild or not ctx.command:
                 return
@@ -311,7 +304,6 @@ class RedRadio(commands.Cog):
             if allowed_guild_id and ctx.guild.id != allowed_guild_id:
                 return
 
-            # Detect Audio summon
             if ctx.command.name != "summon":
                 return
             if not ctx.command.cog_name or ctx.command.cog_name.lower() != "audio":
@@ -352,12 +344,10 @@ class RedRadio(commands.Cog):
                 stream_url = await self.config.stream_url()
                 home = await self._bot_is_home(guild)
 
-                # If station is set, bot must remain home
                 if stream_url and not home:
                     await self._autopanic(guild, "Watchdog: station set but bot is not home")
                     continue
 
-                # If connected but wrong channel, panic
                 vc = guild.voice_client
                 if vc and vc.is_connected() and vc.channel and vc.channel.id != int(vc_id):
                     await self._autopanic(guild, f"Watchdog: bot in wrong VC ({vc.channel.id})")
@@ -369,14 +359,13 @@ class RedRadio(commands.Cog):
                 log.exception("Watchdog loop error")
 
     # -------------------------
-    # DJ Asuka reassurance delivery
+    # DJ Asuka reassurance
     # -------------------------
     async def _send_to_dj(self, guild: discord.Guild, member: discord.Member, embed: discord.Embed) -> None:
         use_dm = await self.config.reassure_use_dm()
         fallback_id = await self.config.reassure_fallback_channel_id()
         control_id = await self.config.control_text_channel_id()
 
-        # DM first
         if use_dm:
             try:
                 await member.send(embed=embed)
@@ -384,7 +373,6 @@ class RedRadio(commands.Cog):
             except Exception:
                 pass
 
-        # Fallback channel if DM fails/disabled
         ch = None
         if fallback_id:
             ch = guild.get_channel(int(fallback_id))
@@ -420,8 +408,6 @@ class RedRadio(commands.Cog):
 
                 if not guild_id or not allowed_vc_id or not dj_user_id:
                     continue
-
-                # Only reassure when a station is actually set
                 if not stream_url or not station_name:
                     continue
 
@@ -429,7 +415,6 @@ class RedRadio(commands.Cog):
                 if not guild:
                     continue
 
-                # Bot must be home
                 if not await self._bot_is_home(guild):
                     continue
 
@@ -437,7 +422,6 @@ class RedRadio(commands.Cog):
                 if not member:
                     continue
 
-                # Is DJ in the allowed VC?
                 dj_in_allowed_vc = bool(
                     member.voice
                     and member.voice.channel
@@ -575,6 +559,42 @@ class RedRadio(commands.Cog):
 
         await ctx.send("Bound. Use rrsetdj to set DJ Asuka. Use rrhome to bring her home.")
 
+    # ✅ NEW: move the bound control text channel
+    @commands.is_owner()
+    @commands.command()
+    async def rrcontrol(self, ctx: commands.Context, channel: Optional[discord.TextChannel] = None):
+        """
+        Move the bound control text channel.
+        Usage:
+          g!rrcontrol            -> set control channel to the channel you ran this in
+          g!rrcontrol #channel   -> set control channel to #channel
+        """
+        if ctx.guild is None:
+            return
+
+        if not await self.config.bound():
+            await ctx.send(f"Not bound yet. Use `{ctx.clean_prefix}rrbind` first.")
+            return
+
+        allowed_guild_id = await self.config.allowed_guild_id()
+        if allowed_guild_id and ctx.guild.id != allowed_guild_id:
+            await ctx.send("Wrong guild.")
+            return
+
+        # Grey Hair Asuka paranoia: require owner in allowed VC to re-key the control room
+        if not await self._require_owner_in_allowed_vc(ctx):
+            return
+
+        target = channel or ctx.channel
+        await self.config.control_text_channel_id.set(target.id)
+
+        # If no explicit fallback is set, follow the control channel
+        fallback = await self.config.reassure_fallback_channel_id()
+        if not fallback:
+            await self.config.reassure_fallback_channel_id.set(target.id)
+
+        await ctx.send(f"🛡️ Control channel moved to {target.mention}.")
+
     @commands.is_owner()
     @commands.command()
     async def rrstatus(self, ctx: commands.Context):
@@ -624,7 +644,6 @@ class RedRadio(commands.Cog):
     @commands.is_owner()
     @commands.command()
     async def rrpanic(self, ctx: commands.Context):
-        # Manual panic requires presence in allowed VC
         if not await self._require_owner_in_allowed_vc(ctx):
             return
 
@@ -649,7 +668,6 @@ class RedRadio(commands.Cog):
     @commands.is_owner()
     @commands.command()
     async def rrunlock(self, ctx: commands.Context):
-        # Unlock requires owner present in allowed VC
         if not await self._require_owner_in_allowed_vc(ctx):
             return
 
@@ -657,7 +675,6 @@ class RedRadio(commands.Cog):
         await self.config.autopanic_reason.set(None)
         await ctx.send("Controls unlocked.")
 
-        # Optional: auto-run rrhome immediately (owner already present)
         await self.rrhome(ctx)
 
     @commands.is_owner()
