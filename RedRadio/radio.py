@@ -263,25 +263,36 @@ class RedRadio(commands.Cog):
         if not is_owner:
             return False
 
+        cmd = (ctx.command.qualified_name if ctx.command else "").lower()
+
+        # Commands allowed before binding
+        prebind_ok = {"rrbind", "rrstatus"}
         if not await self.config.bound():
-            if ctx.command and ctx.command.qualified_name in {"rrbind", "rrstatus"}:
+            if cmd in prebind_ok:
                 return True
             await ctx.send(f"Locked. Bind first with `{ctx.clean_prefix}rrbind`.")
             return False
 
         allowed_guild_id = await self.config.allowed_guild_id()
-        control_text_channel_id = await self.config.control_text_channel_id()
-
         if allowed_guild_id and ctx.guild.id != allowed_guild_id:
             await self._audit_security(ctx.guild, f"Denied: wrong guild ({ctx.guild.id})")
             return False
 
+        # Grey Hair Asuka emergency / re-key commands:
+        # - Allowed even during panic
+        # - Allowed outside the control channel (so you can move the control channel)
+        bypass_control_channel = {"rrcontrol", "rrstatus", "rrpanic", "rrunlock"}
+
+        control_text_channel_id = await self.config.control_text_channel_id()
         if control_text_channel_id and ctx.channel.id != control_text_channel_id:
-            await self._audit_security(ctx.guild, f"Denied: outside control channel ({ctx.channel.id})")
-            return False
+            if cmd not in bypass_control_channel:
+                await self._audit_security(ctx.guild, f"Denied: outside control channel ({ctx.channel.id})")
+                return False
 
         if await self.config.panic_locked():
-            if ctx.command and ctx.command.qualified_name in {"rrstatus", "rrunlock", "rrpanic"}:
+            # While panicked, only allow these commands.
+            panic_ok = {"rrstatus", "rrunlock", "rrpanic", "rrcontrol"}
+            if cmd in panic_ok:
                 return True
             await ctx.send("Panic lock is active.")
             return False
@@ -443,9 +454,6 @@ class RedRadio(commands.Cog):
                     if cid and int(cid) != int(vc_id):
                         await self._autopanic(guild, f"Watchdog: bot in wrong VC ({cid})")
                         continue
-
-                # If station is set and bot is home but player isn't playing, don't autopanic:
-                # unlock recovery handles it. (Grey Hair Asuka = deliberate, not panicky.)
 
             except asyncio.CancelledError:
                 break
@@ -710,17 +718,41 @@ class RedRadio(commands.Cog):
             await ctx.send("Wrong guild.")
             return
 
+        # Grey Hair Asuka paranoia: require owner in allowed VC to re-key the control room
         if not await self._require_owner_in_allowed_vc(ctx):
             return
+
+        old_id = await self.config.control_text_channel_id()
+        old_ch = ctx.guild.get_channel(int(old_id)) if old_id else None
 
         target = channel or ctx.channel
         await self.config.control_text_channel_id.set(target.id)
 
+        # If no explicit fallback is set, follow the control channel
         fallback = await self.config.reassure_fallback_channel_id()
         if not fallback:
             await self.config.reassure_fallback_channel_id.set(target.id)
 
-        await ctx.send(f"🛡️ Control channel moved to {target.mention}.")
+        # Audit-friendly confirmation embed
+        embed = discord.Embed(
+            title="🛡️ Control Channel Re-Keyed",
+            description="Control channel has been moved.",
+            color=discord.Color.orange(),
+        )
+        embed.add_field(name="Old", value=(old_ch.mention if old_ch else "Unknown / unset"), inline=True)
+        embed.add_field(name="New", value=target.mention, inline=True)
+        embed.set_footer(text="Grey Hair Asuka protocol: re-key control room.")
+        await ctx.send(embed=embed)
+
+        # Optional: also send to audit channel if configured
+        try:
+            audit_id = await self.config.audit_channel_id()
+            if audit_id:
+                ach = ctx.guild.get_channel(int(audit_id))
+                if ach and ach.id != ctx.channel.id:
+                    await ach.send(embed=embed)
+        except Exception:
+            pass
 
     @commands.is_owner()
     @commands.command()
