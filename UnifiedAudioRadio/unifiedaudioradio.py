@@ -172,6 +172,20 @@ class UnifiedAudioRadio(commands.Cog):
         self._ll_registered: bool = False
 
     # -------------------------
+    # Lavalink accessor (Audio no longer reliably re-exports it)
+    # -------------------------
+    def _get_lavalink(self):
+        """
+        Prefer importing the red-lavalink library directly.
+        This avoids ImportError on newer Red where Audio doesn't export redbot.cogs.audio.lavalink.
+        """
+        try:
+            import lavalink  # type: ignore
+            return lavalink
+        except Exception:
+            return None
+
+    # -------------------------
     # Blocklist helpers (Radio + YouTube)
     # -------------------------
     def _parse_blocklist(self, csv: str) -> List[str]:
@@ -189,33 +203,33 @@ class UnifiedAudioRadio(commands.Cog):
     # -------------------------
     def _current_track_text_from_audio(self, guild: discord.Guild) -> str:
         """
-        Best-effort: prefer Red Audio's lavalink player metadata.
+        Best-effort: prefer Red Lavalink player metadata.
         Falls back to probing guild.voice_client if lavalink isn't available.
 
         Returns a blob containing title/author/uri/etc, or "" if nothing accessible.
         """
         parts: List[str] = []
 
-        try:
-            from redbot.cogs.audio import lavalink as red_lavalink  # type: ignore
-
-            player = red_lavalink.get_player(guild.id)
-            cur = (
-                getattr(player, "current", None)
-                or getattr(player, "current_track", None)
-                or getattr(player, "track", None)
-            )
-            if cur:
-                for attr in ("title", "author", "uri", "identifier", "track_identifier", "source", "url"):
-                    v = getattr(cur, attr, None)
-                    if v:
-                        parts.append(str(v))
-                if isinstance(cur, dict):
-                    for k in ("title", "author", "uri", "identifier", "source", "url"):
-                        if cur.get(k):
-                            parts.append(str(cur.get(k)))
-        except Exception:
-            pass
+        ll = self._get_lavalink()
+        if ll:
+            try:
+                player = ll.get_player(guild.id)
+                cur = (
+                    getattr(player, "current", None)
+                    or getattr(player, "current_track", None)
+                    or getattr(player, "track", None)
+                )
+                if cur:
+                    for attr in ("title", "author", "uri", "identifier", "track_identifier", "source", "url"):
+                        v = getattr(cur, attr, None)
+                        if v:
+                            parts.append(str(v))
+                    if isinstance(cur, dict):
+                        for k in ("title", "author", "uri", "identifier", "source", "url"):
+                            if cur.get(k):
+                                parts.append(str(cur.get(k)))
+            except Exception:
+                pass
 
         vc = guild.voice_client
         if vc:
@@ -304,11 +318,14 @@ class UnifiedAudioRadio(commands.Cog):
 
             if self._text_matches_blocklist(blob, blocked):
                 # Stop immediately (non-panic). Use rrpanic manually if you hear something unsafe.
-                try:
-                    from redbot.cogs.audio import lavalink as red_lavalink  # type: ignore
-                    p2 = red_lavalink.get_player(guild.id)
-                    await p2.stop()
-                except Exception:
+                ll = self._get_lavalink()
+                if ll:
+                    try:
+                        p2 = ll.get_player(guild.id)
+                        await p2.stop()
+                    except Exception:
+                        pass
+                else:
                     try:
                         await self._vc_disconnect(guild.voice_client)
                     except Exception:
@@ -343,12 +360,15 @@ class UnifiedAudioRadio(commands.Cog):
             self._reassure_task = self.bot.loop.create_task(self._periodic_reassurance_loop())
 
         if not self._ll_registered:
-            try:
-                from redbot.cogs.audio import lavalink as red_lavalink  # type: ignore
-                red_lavalink.register_event_listener(self._ll_listener)
-                self._ll_registered = True
-            except Exception:
-                log.exception("Failed to register lavalink event listener")
+            ll = self._get_lavalink()
+            if ll:
+                try:
+                    ll.register_event_listener(self._ll_listener)
+                    self._ll_registered = True
+                except Exception:
+                    log.exception("Failed to register lavalink event listener")
+            else:
+                log.warning("Lavalink module not available; track-start filtering will be disabled.")
 
     def cog_unload(self):
         for t in (self._watchdog_task, self._reassure_task):
@@ -356,11 +376,12 @@ class UnifiedAudioRadio(commands.Cog):
                 t.cancel()
 
         if self._ll_registered:
-            try:
-                from redbot.cogs.audio import lavalink as red_lavalink  # type: ignore
-                red_lavalink.unregister_event_listener(self._ll_listener)
-            except Exception:
-                pass
+            ll = self._get_lavalink()
+            if ll:
+                try:
+                    ll.unregister_event_listener(self._ll_listener)
+                except Exception:
+                    pass
             self._ll_registered = False
 
         if self.http and not self.http.closed:
@@ -925,11 +946,14 @@ class UnifiedAudioRadio(commands.Cog):
                 if blocked:
                     blob = self._current_track_text_from_audio(guild)
                     if blob and self._text_matches_blocklist(blob, blocked):
-                        try:
-                            from redbot.cogs.audio import lavalink as red_lavalink  # type: ignore
-                            p = red_lavalink.get_player(guild.id)
-                            await p.stop()
-                        except Exception:
+                        ll = self._get_lavalink()
+                        if ll:
+                            try:
+                                p = ll.get_player(guild.id)
+                                await p.stop()
+                            except Exception:
+                                pass
+                        else:
                             try:
                                 await self._vc_disconnect(guild.voice_client)
                             except Exception:
