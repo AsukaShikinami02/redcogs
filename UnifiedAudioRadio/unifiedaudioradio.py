@@ -77,15 +77,15 @@ class UnifiedAudioRadio(commands.Cog):
     """
     Grey Hair Asuka Unified Media Safety Layer (Audio + Radio + Watchdog)
 
-    Adds DJ Asuka-specific behavior:
-    - Notify DJ when YouTube starts
-    - Notify DJ when YouTube stops
+    DJ Asuka behavior:
+    - Notify DJ when YouTube starts / stops
     - DJ can request radio back via g!djradio (notifies Grey Hair Asuka)
-    - g!rrrestore instantly restores the last saved station
-    - NEW: panic recovery + status:
-        - g!rrstatus
-        - g!rrunlock [home|restore|full]
-        - g!rrpanic, g!rrsuspend, g!rrresume, g!rrhard
+
+    Restore behavior:
+    - g!rrrestore restores last media mode:
+        * last mode was radio -> restores last station
+        * last mode was youtube -> replays last youtube query/link
+    - g!rrunlock restore/full uses rrrestore after unlock+home (same behavior)
     """
 
     AUDIO_SUMMON_ALIASES: Set[str] = {"summon", "join", "connect"}
@@ -106,6 +106,7 @@ class UnifiedAudioRadio(commands.Cog):
             allowed_voice_channel_id=None,
             audit_channel_id=None,
             bound_owner_user_id=None,  # who bound
+
             # posture
             panic_locked=True,
             autopanic_enabled=True,
@@ -113,26 +114,37 @@ class UnifiedAudioRadio(commands.Cog):
             suspended=False,
             suspend_reason=None,
             hard_mode=True,
+
             # radio state
             stream_url=None,
             station_name=None,
             last_station_name=None,
             last_station_stream_url=None,
             last_search_query=None,
+
             # audio intent
             audio_intent_active=False,
             audio_intent_started_monotonic=0.0,
+
+            # restore memory
+            last_media_kind=None,        # "radio" | "youtube"
+            last_media_saved_at=0.0,     # unix time
+            last_youtube_query=None,     # query/link fed back into Audio play
+
             # filters
             min_bitrate_kbps=64,
             block_tags_csv="phonk,earrape,nsfw",
+
             # DJ Asuka identity
             dj_user_id=None,
+
             # periodic reassurance (general)
             periodic_reassure_enabled=True,
             reassure_interval_in_vc_sec=300,
             reassure_interval_out_vc_sec=900,
             reassure_use_dm=True,
             reassure_fallback_channel_id=None,
+
             # DJ start/stop notifications
             dj_notify_youtube_start=True,
             dj_notify_youtube_stop=True,
@@ -276,6 +288,35 @@ class UnifiedAudioRadio(commands.Cog):
         return bool(cid and int(cid) == int(allowed_vc_id))
 
     # -------------------------
+    # Restore memory helpers
+    # -------------------------
+    def _extract_play_query(self, ctx: commands.Context) -> Optional[str]:
+        """
+        Best-effort extraction of what the user typed after the command.
+        Works reliably for prefix commands:
+          g!play <query> -> "<query>"
+        """
+        try:
+            content = (ctx.message.content or "").strip()
+            if not content:
+                return None
+            parts = content.split(maxsplit=1)
+            if len(parts) < 2:
+                return None
+            return parts[1].strip() or None
+        except Exception:
+            return None
+
+    async def _remember_last_media(self, kind: str, *, youtube_query: Optional[str] = None) -> None:
+        kind = (kind or "").strip().lower()
+        if kind not in ("radio", "youtube"):
+            return
+        await self.config.last_media_kind.set(kind)
+        await self.config.last_media_saved_at.set(float(time.time()))
+        if kind == "youtube" and youtube_query:
+            await self.config.last_youtube_query.set(str(youtube_query)[:4000])
+
+    # -------------------------
     # Audit / notify
     # -------------------------
     async def _audit_security(self, guild: discord.Guild, reason: str) -> None:
@@ -405,18 +446,19 @@ class UnifiedAudioRadio(commands.Cog):
             description="YouTube started. I’m still here. You’re safe.\n" + line,
             color=discord.Color.dark_teal(),
         )
-        embed.set_footer(text="If you want the radio back, use: g!djradio")
+        embed.set_footer(text="If you want the last media back, use: g!djradio")
         await self._send_to_dj(guild, embed)
 
     async def _dj_youtube_stopped(self, guild: discord.Guild):
         if not await self.config.dj_notify_youtube_stop():
             return
-        last_station = await self.config.last_station_name()
-        msg = (
-            f"YouTube stopped. If you want the radio back: **g!djradio**\nLast station: **{last_station}**"
-            if last_station
-            else "YouTube stopped. If you want the radio back: **g!djradio**"
-        )
+        kind = await self.config.last_media_kind()
+        hint = "**g!djradio**"
+        msg = f"YouTube stopped. If you want the last media back: {hint}"
+        if kind == "radio":
+            last_station = await self.config.last_station_name()
+            if last_station:
+                msg += f"\nLast station: **{last_station}**"
         embed = discord.Embed(title="🖤 It’s okay.", description=msg, color=discord.Color.dark_teal())
         embed.set_footer(text="Grey Hair Asuka protocol: stable transitions.")
         await self._send_to_dj(guild, embed)
@@ -593,11 +635,16 @@ class UnifiedAudioRadio(commands.Cog):
                         if await self._radio_active():
                             await self.config.last_station_name.set(await self.config.station_name())
                             await self.config.last_station_stream_url.set(await self.config.stream_url())
+                            await self._remember_last_media("radio")
                             await self._clear_radio_state()
                             await self._set_presence(None)
 
                         await self.config.audio_intent_active.set(True)
                         await self.config.audio_intent_started_monotonic.set(float(time.monotonic()))
+
+                        yt_query = self._extract_play_query(ctx) or content
+                        await self._remember_last_media("youtube", youtube_query=yt_query)
+
                         await self._dj_youtube_started(ctx.guild)
 
                 # STOP: stop notifications + clear states
@@ -722,9 +769,12 @@ class UnifiedAudioRadio(commands.Cog):
                 radio = await self._radio_active()
                 station_name = await self.config.station_name() if radio else None
                 last_station = await self.config.last_station_name()
+                last_kind = await self.config.last_media_kind()
 
                 if radio and station_name:
                     line = f"**Station:** {station_name}"
+                elif last_kind == "youtube":
+                    line = "**Media:** YouTube playback active"
                 elif last_station:
                     line = f"**Media:** playback active\n**Radio saved:** {last_station}"
                 else:
@@ -854,6 +904,10 @@ class UnifiedAudioRadio(commands.Cog):
         audio_intent = await self.config.audio_intent_active()
         audio_intent_started = float(await self.config.audio_intent_started_monotonic() or 0.0)
 
+        last_kind = await self.config.last_media_kind()
+        last_saved_at = float(await self.config.last_media_saved_at() or 0.0)
+        last_yt = await self.config.last_youtube_query()
+
         vc = ctx.guild.voice_client
         vc_connected = self._vc_connected(vc)
         vc_channel_id = self._vc_channel_id(vc)
@@ -924,7 +978,19 @@ class UnifiedAudioRadio(commands.Cog):
             inline=False,
         )
 
-        embed.set_footer(text="Commands: rrstatus | rrunlock [home|restore|full] | rrpanic | rrsuspend | rrresume | rrhard")
+        embed.add_field(
+            name="Restore Memory",
+            value=(
+                f"**Last Media Kind:** {last_kind or '—'}\n"
+                f"**Last Saved At (unix):** {last_saved_at if last_saved_at else '—'}\n"
+                f"**Last YouTube Query:** {(last_yt[:200] + '…') if (last_yt and len(last_yt) > 200) else (last_yt or '—')}"
+            ),
+            inline=False,
+        )
+
+        embed.set_footer(
+            text="Commands: rrstatus | rrunlock [home|restore|full] | rrpanic | rrsuspend | rrresume | rrhard | rrrestore"
+        )
         await ctx.send(embed=embed)
 
     @commands.is_owner()
@@ -972,7 +1038,6 @@ class UnifiedAudioRadio(commands.Cog):
 
         await self._suspend(reason)
 
-        # Optional: disconnect + clear media so the world is quiet and stable.
         try:
             await self._vc_disconnect(ctx.guild.voice_client)
         except Exception:
@@ -1035,7 +1100,7 @@ class UnifiedAudioRadio(commands.Cog):
         Modes:
         - (none)   : just clears panic lock
         - home     : clears panic + summons bot to locked VC
-        - restore  : clears panic + summons home + restores last station
+        - restore  : clears panic + summons home + restores last media (rrrestore)
         - full     : same as restore
         """
         if ctx.guild is None:
@@ -1044,18 +1109,14 @@ class UnifiedAudioRadio(commands.Cog):
             await ctx.send("Not bound yet. Use `rrbind` first.")
             return
 
-        # Only unlock if owner is in the locked VC (prevents hostile unlocks).
         if not await self._require_owner_in_allowed_vc(ctx):
             return
 
-        # Clear panic + reasons
         await self.config.panic_locked.set(False)
         await self.config.autopanic_reason.set(None)
 
-        # Panic recovery should fully reset posture
         await self._unsuspend()
 
-        # Clear internal flags (prevents "panic still active" / stale-state confusion)
         await self._clear_radio_state()
         await self._clear_audio_intent()
         await self._set_presence(None)
@@ -1075,19 +1136,8 @@ class UnifiedAudioRadio(commands.Cog):
                 return
 
         if do_restore:
-            last_name = await self.config.last_station_name()
-            last_url = await self.config.last_station_stream_url()
-
-            if last_name and last_url:
-                await self._clear_audio_intent()
-                await self.config.stream_url.set(last_url)
-                await self.config.station_name.set(last_name)
-
-                ok = await self._audio_play(ctx, last_url)
-                if ok:
-                    await self._set_presence(f"📻 {last_name}")
-            else:
-                await ctx.send("Unlocked + home, but no saved station exists yet (nothing to restore).")
+            await ctx.send("Attempting restore…")
+            await self.rrrestore(ctx)
 
         await self._notify_control(
             ctx.guild,
@@ -1099,7 +1149,7 @@ class UnifiedAudioRadio(commands.Cog):
         )
 
         if do_restore:
-            await ctx.send("Unlocked. Home restored (and station restore attempted).")
+            await ctx.send("Unlocked. Home restored (and restore attempted).")
         elif do_home:
             await ctx.send("Unlocked. She’s coming home.")
         else:
@@ -1319,6 +1369,7 @@ class UnifiedAudioRadio(commands.Cog):
 
         await self.config.last_station_name.set(station.name)
         await self.config.last_station_stream_url.set(station.stream_url)
+        await self._remember_last_media("radio")
 
         await self._clear_audio_intent()
 
@@ -1339,11 +1390,15 @@ class UnifiedAudioRadio(commands.Cog):
         embed.set_footer(text="No track titles. Station name only.")
         await ctx.send(embed=embed)
 
+    # ✅ UPDATED: restore last media (radio OR youtube)
     @commands.is_owner()
     @commands.command()
     async def rrrestore(self, ctx: commands.Context):
         """
-        Restore the last saved radio station immediately.
+        Restore last saved media:
+        - last mode was radio -> restores last station
+        - last mode was youtube -> replays last youtube query/link
+
         Requires: owner in locked VC + bot home + not suspended/panic.
         """
         if not await self._require_owner_in_allowed_vc(ctx):
@@ -1354,14 +1409,50 @@ class UnifiedAudioRadio(commands.Cog):
             await ctx.send("Suspended. Use `rrresume` first.")
             return
         if await self.config.panic_locked():
-            await ctx.send("Panic lock is active. Use `rrunlock restore`.")
+            await ctx.send("Panic lock is active. Use `rrunlock restore` (or `rrunlock home`).")
             return
 
+        kind = (await self.config.last_media_kind()) or "radio"
+
+        # ---- YOUTUBE RESTORE ----
+        if kind == "youtube":
+            yt_query = await self.config.last_youtube_query()
+            if yt_query:
+                await self._clear_radio_state()
+                await self.config.audio_intent_active.set(True)
+                await self.config.audio_intent_started_monotonic.set(float(time.monotonic()))
+
+                ok = await self._audio_play(ctx, yt_query)
+                if not ok:
+                    return
+
+                await self._set_presence("▶️ YouTube")
+                await self._remember_last_media("youtube", youtube_query=yt_query)
+
+                embed = discord.Embed(
+                    title="▶️ Restored (YouTube)",
+                    description=f"Replayed the last YouTube request.\n\n**Query:** `{yt_query[:800]}`",
+                    color=discord.Color.blurple(),
+                )
+                embed.set_footer(text="Grey Hair Asuka protocol: instant restore (YouTube).")
+                await ctx.send(embed=embed)
+                return
+
+            # if missing yt query, fall through to radio restore
+            kind = "radio"
+
+        # ---- RADIO RESTORE (default) ----
         last_name = await self.config.last_station_name()
         last_url = await self.config.last_station_stream_url()
 
         if not last_name or not last_url:
-            await ctx.send("No saved station to restore yet. Use `playstation` first.")
+            # If radio isn't available but youtube is, attempt youtube anyway.
+            yt_query = await self.config.last_youtube_query()
+            if yt_query:
+                await self.config.last_media_kind.set("youtube")
+                await ctx.send("No saved station found — restoring YouTube instead.")
+                return await self.rrrestore(ctx)
+            await ctx.send("No saved station (or YouTube query) to restore yet.")
             return
 
         await self._clear_audio_intent()
@@ -1374,13 +1465,14 @@ class UnifiedAudioRadio(commands.Cog):
             return
 
         await self._set_presence(f"📻 {last_name}")
+        await self._remember_last_media("radio")
 
         embed = discord.Embed(
-            title="📻 Restored",
+            title="📻 Restored (Radio)",
             description=f"**Station:** {last_name}\n🔗 [Stream Link]({last_url})",
             color=discord.Color.blurple(),
         )
-        embed.set_footer(text="Grey Hair Asuka protocol: instant restore.")
+        embed.set_footer(text="Grey Hair Asuka protocol: instant restore (Radio).")
         await ctx.send(embed=embed)
 
     @commands.is_owner()
@@ -1394,7 +1486,7 @@ class UnifiedAudioRadio(commands.Cog):
         await ctx.send(embed=discord.Embed(title="⏹️ Stopped", description="Radio stream stopped.", color=discord.Color.red()))
 
     # -------------------------
-    # DJ command: request radio back (notify Grey Hair Asuka)
+    # DJ command: request last media back (notify Grey Hair Asuka)
     # -------------------------
     @commands.guild_only()
     @commands.command()
@@ -1417,14 +1509,20 @@ class UnifiedAudioRadio(commands.Cog):
         owner_id = await self.config.bound_owner_user_id()
         owner_mention = f"<@{int(owner_id)}>" if owner_id else "@owner"
 
+        last_kind = await self.config.last_media_kind()
         last_station = await self.config.last_station_name()
-        last_line = f"Last station saved: **{last_station}**" if last_station else "No saved station on record."
+        last_yt = await self.config.last_youtube_query()
+
+        if last_kind == "youtube":
+            last_line = f"Last media saved: **YouTube**\n**Query:** `{(last_yt or '')[:300]}`" if last_yt else "Last media saved: **YouTube** (but query missing)."
+        else:
+            last_line = f"Last media saved: **Radio**\nLast station: **{last_station}**" if last_station else "Last media saved: **Radio** (but station missing)."
 
         note = (note or "").strip()
         note_line = f"\n**DJ note:** {note}" if note else ""
 
         embed = discord.Embed(
-            title="📻 DJ Asuka requested the radio back",
+            title="📻 DJ Asuka requested the last media back",
             description=f"{owner_mention}\n{last_line}{note_line}\n\nSuggested action: `g!rrrestore` (or `g!rrunlock restore` if panic)",
             color=discord.Color.dark_teal(),
         )
@@ -1433,7 +1531,7 @@ class UnifiedAudioRadio(commands.Cog):
 
         confirm = discord.Embed(
             title="🖤 Okay.",
-            description="I told Grey Hair Asuka you want the radio back.",
+            description="I told Grey Hair Asuka you want the last media back.",
             color=discord.Color.dark_teal(),
         )
         await ctx.send(embed=confirm)
