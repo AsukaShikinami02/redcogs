@@ -1,4 +1,3 @@
-```python
 import asyncio
 import logging
 import time
@@ -2138,4 +2137,3 @@ class UnifiedAudioRadio(commands.Cog):
 
 async def setup(bot):
     await bot.add_cog(UnifiedAudioRadio(bot))
-```
