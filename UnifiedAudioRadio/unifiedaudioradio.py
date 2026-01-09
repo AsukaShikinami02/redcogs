@@ -1,8 +1,11 @@
+```python
 import asyncio
 import logging
 import time
 import urllib.parse
 from dataclasses import dataclass
+from datetime import datetime, timezone
+from zoneinfo import ZoneInfo
 from typing import Any, Dict, List, Optional, Set, Tuple
 
 import aiohttp
@@ -80,6 +83,11 @@ class UnifiedAudioRadio(commands.Cog):
     DJ Asuka behavior:
     - Notify DJ when YouTube starts / stops
     - DJ can request radio back via g!djradio (notifies Grey Hair Asuka)
+    - DJ can request YouTube via g!djyoutube <query/link> (notifies Grey Hair Asuka)
+    - Grey sleep reminder escalates if DJ stays in VC too long (ANY time of day)
+      * Gentle -> Firm -> GO TO BED
+      * One-time final message: "I'm staying. You can rest."
+      * DJ can acknowledge: g!imgoing (resets reminder pressure + optionally notifies owner)
 
     IMPORTANT BEHAVIOR (guard rails):
     - rrrestore = RADIO restore ONLY (last saved station) AND force-switch (stop YouTube first)
@@ -152,6 +160,22 @@ class UnifiedAudioRadio(commands.Cog):
             # DJ start/stop notifications
             dj_notify_youtube_start=True,
             dj_notify_youtube_stop=True,
+
+            # Sleep reminder (DJ)
+            dj_sleep_reminder_enabled=True,
+            dj_sleep_after_minutes=180,          # threshold for first nudge
+            dj_sleep_repeat_minutes=45,          # repeat cadence once threshold exceeded
+            dj_sleep_quiet_start_hour=1,         # kept for status/visibility (no longer required)
+            dj_sleep_quiet_end_hour=6,
+            dj_sleep_timezone="America/New_York",
+
+            # DJ YouTube requests (just a message to owner + optional memory)
+            dj_last_youtube_request=None,
+            dj_last_youtube_request_ts=0.0,
+
+            # DJ sleep acknowledge memory (optional)
+            dj_last_sleep_ack_note=None,
+            dj_last_sleep_ack_ts=0.0,
         )
 
         self._stations_cache: List[Station] = []
@@ -168,17 +192,49 @@ class UnifiedAudioRadio(commands.Cog):
         self._last_reassure_in_vc_ts: float = 0.0
         self._last_reassure_out_vc_ts: float = 0.0
 
+        # Sleep reminder in-memory timers (per "session" while DJ stays in VC)
+        self._dj_in_vc_since_monotonic: float = 0.0
+        self._last_sleep_reminder_monotonic: float = 0.0
+        self._sleep_reminder_count: int = 0
+        self._sleep_final_sent: bool = False
+
         # Lavalink event hook registration state (best-effort)
         self._ll_registered: bool = False
+
+    # -------------------------
+    # Time helpers (sleep reminders)
+    # -------------------------
+    async def _dj_now_local(self) -> datetime:
+        tz_name = await self.config.dj_sleep_timezone()
+        try:
+            tz = ZoneInfo(tz_name or "UTC")
+        except Exception:
+            tz = timezone.utc
+        return datetime.now(tz)
+
+    async def _in_quiet_hours(self) -> bool:
+        """
+        Quiet hours are [start, end), wrap-around supported (e.g., 1 -> 6).
+        Sleep reminders no longer REQUIRE quiet hours, but we keep this for rrstatus visibility.
+        """
+        start = int(await self.config.dj_sleep_quiet_start_hour() or 0)
+        end = int(await self.config.dj_sleep_quiet_end_hour() or 0)
+        start = max(0, min(23, start))
+        end = max(0, min(23, end))
+
+        now = await self._dj_now_local()
+        h = now.hour
+
+        if start == end:
+            return True
+        if start < end:
+            return start <= h < end
+        return (h >= start) or (h < end)
 
     # -------------------------
     # Lavalink accessor (Audio no longer reliably re-exports it)
     # -------------------------
     def _get_lavalink(self):
-        """
-        Prefer importing the red-lavalink library directly.
-        This avoids ImportError on newer Red where Audio doesn't export redbot.cogs.audio.lavalink.
-        """
         try:
             import lavalink  # type: ignore
             return lavalink
@@ -202,12 +258,6 @@ class UnifiedAudioRadio(commands.Cog):
     # Lavalink / Audio track metadata access (best-effort)
     # -------------------------
     def _current_track_text_from_audio(self, guild: discord.Guild) -> str:
-        """
-        Best-effort: prefer Lavalink player metadata.
-        Falls back to probing guild.voice_client if lavalink isn't available.
-
-        Returns a blob containing title/author/uri/etc, or "" if nothing accessible.
-        """
         parts: List[str] = []
 
         ll = self._get_lavalink()
@@ -259,7 +309,6 @@ class UnifiedAudioRadio(commands.Cog):
                 return True
         return False
 
-    # IMPORTANT: must be a coroutine for lavalink.register_event_listener
     async def _ll_listener(self, player: Any, event: Any, *args: Any, **kwargs: Any) -> None:
         try:
             await self._handle_lavalink_event(player, event)
@@ -267,11 +316,6 @@ class UnifiedAudioRadio(commands.Cog):
             log.exception("Lavalink listener error")
 
     async def _handle_lavalink_event(self, player: Any, event: Any) -> None:
-        """
-        Best-effort YouTube/direct-link filter:
-        when a track starts, inspect resolved metadata and stop if blocked.
-        (Manual rrpanic remains your primary safety override.)
-        """
         try:
             if not self._track_start_eventish(event):
                 return
@@ -666,13 +710,13 @@ class UnifiedAudioRadio(commands.Cog):
         if not await self.config.dj_notify_youtube_start():
             return
         last_station = await self.config.last_station_name()
-        line = f"Last radio station saved: **{last_station}**" if last_station else "Radio state saved."
+        line = f"last radio saved: **{last_station}**" if last_station else "radio state saved."
         embed = discord.Embed(
-            title="🖤 It’s okay.",
-            description="YouTube started. I’m still here. You’re safe.\n" + line,
+            title="🖤 it’s ok.",
+            description="youtube started. i'm still here. you're safe.\n" + line,
             color=discord.Color.dark_teal(),
         )
-        embed.set_footer(text="If you want the radio back, use: g!djradio")
+        embed.set_footer(text="if you want the radio back: g!djradio")
         await self._send_to_dj(guild, embed)
 
     async def _dj_youtube_stopped(self, guild: discord.Guild):
@@ -680,12 +724,72 @@ class UnifiedAudioRadio(commands.Cog):
             return
         last_station = await self.config.last_station_name()
         msg = (
-            f"YouTube stopped. If you want the radio back: **g!djradio**\nLast station: **{last_station}**"
+            f"youtube stopped. if you want radio back: **g!djradio**\nlast station: **{last_station}**"
             if last_station
-            else "YouTube stopped. If you want the radio back: **g!djradio**"
+            else "youtube stopped. if you want radio back: **g!djradio**"
         )
-        embed = discord.Embed(title="🖤 It’s okay.", description=msg, color=discord.Color.dark_teal())
-        embed.set_footer(text="Grey Hair Asuka protocol: stable transitions.")
+        embed = discord.Embed(title="🖤 it’s ok.", description=msg, color=discord.Color.dark_teal())
+        embed.set_footer(text="grey hair asuka protocol: stable transitions.")
+        await self._send_to_dj(guild, embed)
+
+    async def _dj_sleep_reminder(self, guild: discord.Guild, minutes_in_vc: int, level: int):
+        # Grey-coded escalation: 1 gentle -> 2 firm -> 3 GO TO BED
+        local = await self._dj_now_local()
+        try:
+            hhmm = local.strftime("%-I:%M %p")
+        except Exception:
+            hhmm = local.strftime("%I:%M %p").lstrip("0")
+
+        if level <= 1:
+            title = "…hey"
+            desc = (
+                f"you’ve been in there for **{minutes_in_vc} min**.\n"
+                f"it’s **{hhmm}**.\n\n"
+                "pls go sleep soon, ok?\n"
+                "water. stretch. bed.\n"
+                "i'm fine. i can stay."
+            )
+            footer = "gentle nudge. (im worried.)"
+        elif level == 2:
+            title = "ok. no."
+            desc = (
+                f"**{minutes_in_vc} min** is a lot.\n"
+                f"time: **{hhmm}**\n\n"
+                "go sleep. seriously.\n"
+                "leave the vc.\n"
+                "bed. now.\n"
+                "i’m not letting you rot in here."
+            )
+            footer = "firm nudge. (please listen.)"
+        else:
+            title = "go. to. bed."
+            desc = (
+                f"you’re still here.\n"
+                f"**{minutes_in_vc} min**.\n"
+                f"**{hhmm}**.\n\n"
+                "GO TO BED.\n"
+                "right now.\n"
+                "i’m not arguing.\n"
+                "pls."
+            )
+            footer = "hard stop. (i mean it.)"
+
+        embed = discord.Embed(title=title, description=desc, color=discord.Color.dark_teal())
+        embed.set_footer(text=f"grey hair asuka: {footer}  |  ack: g!imgoing")
+        await self._send_to_dj(guild, embed)
+
+    async def _dj_sleep_final(self, guild: discord.Guild):
+        embed = discord.Embed(
+            title="…last thing.",
+            description=(
+                "i’m staying.\n"
+                "you can rest.\n\n"
+                "you don't have to keep watch.\n"
+                "i've got it."
+            ),
+            color=discord.Color.dark_teal(),
+        )
+        embed.set_footer(text="(one-time) grey hair asuka protocol: you rest, i guard.")
         await self._send_to_dj(guild, embed)
 
     # -------------------------
@@ -697,7 +801,8 @@ class UnifiedAudioRadio(commands.Cog):
 
         cmd = (ctx.command.qualified_name if ctx.command else "").lower()
 
-        if cmd == "djradio":
+        # DJ-only commands bypass owner-only gate (but still locked to the bound guild)
+        if cmd in ("djradio", "djyoutube", "imgoing"):
             allowed_guild_id = await self.config.allowed_guild_id()
             dj_user_id = await self.config.dj_user_id()
             if allowed_guild_id and ctx.guild.id != int(allowed_guild_id):
@@ -978,7 +1083,7 @@ class UnifiedAudioRadio(commands.Cog):
                 log.exception("Watchdog loop error")
 
     # -------------------------
-    # Periodic reassurance loop (general)
+    # Periodic reassurance loop (general + sleep reminder)
     # -------------------------
     async def _periodic_reassurance_loop(self):
         await self.bot.wait_until_ready()
@@ -992,8 +1097,6 @@ class UnifiedAudioRadio(commands.Cog):
                     continue
                 if await self.config.suspended():
                     continue
-                if not await self.config.periodic_reassure_enabled():
-                    continue
 
                 guild_id = await self.config.allowed_guild_id()
                 allowed_vc_id = await self.config.allowed_voice_channel_id()
@@ -1005,9 +1108,14 @@ class UnifiedAudioRadio(commands.Cog):
                 if not guild:
                     continue
 
-                if not await self._any_active(guild):
-                    continue
-                if not await self._bot_is_home(guild):
+                # Sleep reminder: track DJ sitting in the locked VC (ANY time of day),
+                # but only when bot is home (same "safe room").
+                bot_home = await self._bot_is_home(guild)
+                if not bot_home:
+                    self._dj_in_vc_since_monotonic = 0.0
+                    self._last_sleep_reminder_monotonic = 0.0
+                    self._sleep_reminder_count = 0
+                    self._sleep_final_sent = False
                     continue
 
                 member = guild.get_member(int(dj_user_id))
@@ -1018,47 +1126,93 @@ class UnifiedAudioRadio(commands.Cog):
                     member.voice and member.voice.channel and member.voice.channel.id == int(allowed_vc_id)
                 )
 
+                now_m = time.monotonic()
+
+                # Track "DJ not leaving"
+                if dj_in_allowed_vc:
+                    if self._dj_in_vc_since_monotonic <= 0.0:
+                        self._dj_in_vc_since_monotonic = now_m
+                        self._last_sleep_reminder_monotonic = 0.0
+                        self._sleep_reminder_count = 0
+                        self._sleep_final_sent = False
+                else:
+                    self._dj_in_vc_since_monotonic = 0.0
+                    self._last_sleep_reminder_monotonic = 0.0
+                    self._sleep_reminder_count = 0
+                    self._sleep_final_sent = False
+
+                # ---- sleep reminder (ANY TIME) ----
+                if dj_in_allowed_vc and await self.config.dj_sleep_reminder_enabled():
+                    if self._dj_in_vc_since_monotonic > 0.0:
+                        mins = int((now_m - self._dj_in_vc_since_monotonic) // 60)
+                        threshold = int(await self.config.dj_sleep_after_minutes() or 0)
+                        repeat = int(await self.config.dj_sleep_repeat_minutes() or 0)
+                        repeat = max(10, repeat)  # don't spam
+
+                        if threshold > 0 and mins >= threshold:
+                            if (
+                                self._last_sleep_reminder_monotonic <= 0.0
+                                or (now_m - self._last_sleep_reminder_monotonic) >= (repeat * 60)
+                            ):
+                                self._last_sleep_reminder_monotonic = now_m
+
+                                # Escalate: gentle -> firm -> GO TO BED
+                                self._sleep_reminder_count += 1
+                                level = 1 if self._sleep_reminder_count <= 1 else (2 if self._sleep_reminder_count == 2 else 3)
+                                await self._dj_sleep_reminder(guild, mins, level)
+
+                                # One-time final "I'm staying. You can rest."
+                                if level >= 3 and not self._sleep_final_sent:
+                                    self._sleep_final_sent = True
+                                    await self._dj_sleep_final(guild)
+
+                # ---- reassurance messages (only when playback active) ----
+                if not await self.config.periodic_reassure_enabled():
+                    continue
+                if not await self._any_active(guild):
+                    continue
+                if not bot_home:
+                    continue
+
                 radio = await self._radio_active()
                 station_name = await self.config.station_name() if radio else None
                 last_station = await self.config.last_station_name()
                 audio_intent = await self.config.audio_intent_active()
 
                 if radio and station_name:
-                    line = f"**Station:** {station_name}"
+                    line = f"**station:** {station_name}"
                 elif audio_intent:
-                    line = "**Media:** YouTube playback active"
+                    line = "**media:** youtube playback active"
                 elif last_station:
-                    line = f"**Media:** playback active\n**Radio saved:** {last_station}"
+                    line = f"**media:** playback active\n**radio saved:** {last_station}"
                 else:
-                    line = "**Media:** playback active"
-
-                now = time.monotonic()
+                    line = "**media:** playback active"
 
                 if dj_in_allowed_vc:
                     interval = max(int(await self.config.reassure_interval_in_vc_sec() or 0), 30)
-                    if now - self._last_reassure_in_vc_ts < interval:
+                    if now_m - self._last_reassure_in_vc_ts < interval:
                         continue
-                    self._last_reassure_in_vc_ts = now
+                    self._last_reassure_in_vc_ts = now_m
 
                     embed = discord.Embed(
-                        title="🖤 It’s okay.",
-                        description=f"You're safe. I’m here. We’re staying home.\n{line}",
+                        title="🖤 it’s ok.",
+                        description=f"you’re safe. i’m here.\n{line}",
                         color=discord.Color.dark_teal(),
                     )
-                    embed.set_footer(text="Grey Hair Asuka protocol: reassurance (in VC).")
+                    embed.set_footer(text="grey hair asuka protocol: reassurance (in vc).")
                     await self._send_to_dj(guild, embed)
                 else:
                     interval = max(int(await self.config.reassure_interval_out_vc_sec() or 0), 60)
-                    if now - self._last_reassure_out_vc_ts < interval:
+                    if now_m - self._last_reassure_out_vc_ts < interval:
                         continue
-                    self._last_reassure_out_vc_ts = now
+                    self._last_reassure_out_vc_ts = now_m
 
                     embed = discord.Embed(
-                        title="🖤 It’s okay.",
-                        description=f"I'm still here. You're safe even if you're not in the room.\n{line}",
+                        title="🖤 it’s ok.",
+                        description=f"i’m still here. even if you’re not in the room.\n{line}",
                         color=discord.Color.dark_teal(),
                     )
-                    embed.set_footer(text="Grey Hair Asuka protocol: reassurance (out of VC).")
+                    embed.set_footer(text="grey hair asuka protocol: reassurance (out of vc).")
                     await self._send_to_dj(guild, embed)
 
             except asyncio.CancelledError:
@@ -1170,6 +1324,15 @@ class UnifiedAudioRadio(commands.Cog):
         now = time.monotonic()
         intent_age = self._fmt_secs(now - audio_intent_started) if (audio_intent and audio_intent_started) else "—"
 
+        # Sleep reminder status
+        sleep_enabled = await self.config.dj_sleep_reminder_enabled()
+        sleep_after = int(await self.config.dj_sleep_after_minutes() or 0)
+        sleep_repeat = int(await self.config.dj_sleep_repeat_minutes() or 0)
+        sleep_start = int(await self.config.dj_sleep_quiet_start_hour() or 0)
+        sleep_end = int(await self.config.dj_sleep_quiet_end_hour() or 0)
+        sleep_tz = await self.config.dj_sleep_timezone()
+        in_quiet = await self._in_quiet_hours()
+
         control_ch = ctx.guild.get_channel(int(control_id)) if control_id else None
         audit_ch = ctx.guild.get_channel(int(audit_id)) if audit_id else None
         allowed_vc = ctx.guild.get_channel(int(allowed_vc_id)) if allowed_vc_id else None
@@ -1248,8 +1411,22 @@ class UnifiedAudioRadio(commands.Cog):
             inline=False,
         )
 
+        embed.add_field(
+            name="DJ Sleep Reminder",
+            value=(
+                f"**Enabled:** {self._fmt_yesno(bool(sleep_enabled))}\n"
+                f"**After:** {sleep_after} min\n"
+                f"**Repeat:** {sleep_repeat} min\n"
+                f"**Timezone:** {sleep_tz or '—'}\n"
+                f"**Quiet Hours (info only):** {sleep_start:02d}:00 → {sleep_end:02d}:00  ({'IN' if in_quiet else 'OUT'})\n"
+                f"**Escalation:** gentle → firm → GO TO BED (+ one-time final message)\n"
+                f"**DJ Ack:** g!imgoing"
+            ),
+            inline=False,
+        )
+
         embed.set_footer(
-            text="Commands: rrstatus | rrpanic | rrunlock [home|resume|full|radio] | rrrestore | rrsuspend | rrresume | rrhard"
+            text="Commands: rrstatus | rrpanic | rrunlock [home|resume|full|radio] | rrrestore | rrsuspend | rrresume | rrhard | djradio | djyoutube | imgoing"
         )
         await ctx.send(embed=embed)
 
@@ -1436,7 +1613,6 @@ class UnifiedAudioRadio(commands.Cog):
 
         m = (mode or "").strip().lower()
 
-        # SAFE DEFAULT: no resume unless explicitly requested
         do_home = m in ("", "home", "resume", "full", "radio")
         do_resume = m in ("resume", "full")
         do_radio = m == "radio"
@@ -1455,7 +1631,6 @@ class UnifiedAudioRadio(commands.Cog):
                 await ctx.send("Unlocked, but summon failed. Try `rrhome`.")
                 return
 
-        # radio-only safe fallback
         if do_radio:
             ok, msg = await self._restore_radio_after_unlock(ctx)
             result_line = f"✅ {msg}" if ok else f"⚠️ Unlock complete, but radio restore failed. ({msg})"
@@ -1469,7 +1644,6 @@ class UnifiedAudioRadio(commands.Cog):
             )
             return
 
-        # resume (explicit only)
         if do_resume:
             ok, msg = await self._attempt_resume_after_unlock(ctx)
             result_line = f"✅ {msg}" if ok else f"⚠️ Unlock complete, but nothing resumed. ({msg})"
@@ -1483,7 +1657,6 @@ class UnifiedAudioRadio(commands.Cog):
             )
             return
 
-        # default safe: no playback
         await ctx.send("✅ Unlocked + homed. Playback is OFF by default. Use `rrunlock radio` or `rrunlock resume`.")
         await self._clear_panic_snapshot()
         await self._notify_control(
@@ -1589,6 +1762,9 @@ class UnifiedAudioRadio(commands.Cog):
 
         await ctx.send("Home command executed.")
 
+    # -------------------------
+    # Radio search / play
+    # -------------------------
     @commands.is_owner()
     @commands.command()
     async def searchstations(self, ctx: commands.Context, *, query: str):
@@ -1788,7 +1964,7 @@ class UnifiedAudioRadio(commands.Cog):
         )
 
     # -------------------------
-    # DJ command
+    # DJ commands
     # -------------------------
     @commands.guild_only()
     @commands.command()
@@ -1826,12 +2002,140 @@ class UnifiedAudioRadio(commands.Cog):
         await control.send(embed=embed)
 
         confirm = discord.Embed(
-            title="🖤 Okay.",
-            description="I told Grey Hair Asuka you want the radio back.",
+            title="🖤 okay.",
+            description="i told Grey you want the radio back.",
             color=discord.Color.dark_teal(),
         )
         await ctx.send(embed=confirm)
 
+    @commands.guild_only()
+    @commands.command()
+    async def djyoutube(self, ctx: commands.Context, *, query: str):
+        """
+        DJ Asuka -> Grey Hair Asuka: "I want this on YouTube."
+        This does NOT auto-play (owner still controls playback in the perimeter).
+        """
+        if not ctx.guild:
+            return
+
+        allowed_guild_id = await self.config.allowed_guild_id()
+        if allowed_guild_id and ctx.guild.id != int(allowed_guild_id):
+            return
+
+        dj_user_id = await self.config.dj_user_id()
+        if not dj_user_id or ctx.author.id != int(dj_user_id):
+            return
+
+        q = (query or "").strip()
+        if not q:
+            await ctx.send("…type what you want. link or search.")
+            return
+
+        blocked = await self._blocked_terms()
+        if blocked and self._text_matches_blocklist(q, blocked):
+            deny = discord.Embed(
+                title="no.",
+                description="that request hits my blocklist. pick something else.",
+                color=discord.Color.orange(),
+            )
+            deny.set_footer(text="Grey Hair Asuka protocol: deny unsafe requests.")
+            await ctx.send(embed=deny)
+            return
+
+        control = await self._control_channel(ctx.guild)
+        if not control:
+            return
+
+        owner_id = await self.config.bound_owner_user_id()
+        owner_mention = f"<@{int(owner_id)}>" if owner_id else "@owner"
+
+        await self.config.dj_last_youtube_request.set(q[:4000])
+        await self.config.dj_last_youtube_request_ts.set(float(time.monotonic()))
+
+        embed = discord.Embed(
+            title="▶️ DJ Asuka requested YouTube",
+            description=(
+                f"{owner_mention}\n"
+                f"**Request:** {q}\n\n"
+                "Suggested action (owner, in control channel + locked VC):\n"
+                f"`g!play {q}`"
+            ),
+            color=discord.Color.dark_teal(),
+        )
+        embed.set_footer(text="Grey Hair Asuka protocol: DJ request queued (manual approval).")
+        await control.send(embed=embed)
+
+        confirm = discord.Embed(
+            title="…ok.",
+            description="i told Grey. she’ll handle it. don’t spam.",
+            color=discord.Color.dark_teal(),
+        )
+        await ctx.send(embed=confirm)
+
+    @commands.guild_only()
+    @commands.command()
+    async def imgoing(self, ctx: commands.Context, *, note: str = ""):
+        """
+        DJ acknowledgement: "I'm going to sleep / I'm leaving / okay."
+        This relaxes the reminder pressure immediately (even if DJ hasn't left VC yet).
+        """
+        if not ctx.guild:
+            return
+
+        allowed_guild_id = await self.config.allowed_guild_id()
+        if allowed_guild_id and ctx.guild.id != int(allowed_guild_id):
+            return
+
+        dj_user_id = await self.config.dj_user_id()
+        if not dj_user_id or ctx.author.id != int(dj_user_id):
+            return
+
+        # Cool down reminders right away.
+        now_m = time.monotonic()
+        self._last_sleep_reminder_monotonic = now_m
+        self._sleep_reminder_count = 0
+        self._sleep_final_sent = False
+        # If they're still in VC, restart the "since" timer so they don't get hit again immediately.
+        if self._dj_in_vc_since_monotonic > 0.0:
+            self._dj_in_vc_since_monotonic = now_m
+
+        note = (note or "").strip()
+        await self.config.dj_last_sleep_ack_note.set(note[:500] if note else None)
+        await self.config.dj_last_sleep_ack_ts.set(float(now_m))
+
+        # Confirm to DJ (Grey-coded)
+        embed = discord.Embed(
+            title="…good.",
+            description=(
+                "ok.\n"
+                "go sleep.\n"
+                "for real.\n\n"
+                "i’m here.\n"
+                "i’ve got it."
+            ),
+            color=discord.Color.dark_teal(),
+        )
+        embed.set_footer(text="(ack received) grey hair asuka: proud of u. now go.")
+        await ctx.send(embed=embed)
+
+        # Optional notify owner/control (so Grey Hair Asuka knows DJ is trying to rest)
+        control = await self._control_channel(ctx.guild)
+        if control:
+            owner_id = await self.config.bound_owner_user_id()
+            owner_mention = f"<@{int(owner_id)}>" if owner_id else "@owner"
+            note_line = f"\n**DJ note:** {note}" if note else ""
+            msg = discord.Embed(
+                title="🌙 DJ Asuka acknowledged sleep reminder",
+                description=f"{owner_mention}\nDJ used `g!imgoing` (trying to rest / leave).{note_line}",
+                color=discord.Color.dark_teal(),
+            )
+            msg.set_footer(text="Grey Hair Asuka protocol: DJ compliance logged.")
+            try:
+                await control.send(embed=msg)
+            except Exception:
+                pass
+
 
 async def setup(bot):
     await bot.add_cog(UnifiedAudioRadio(bot))
+```
