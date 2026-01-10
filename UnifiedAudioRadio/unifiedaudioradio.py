@@ -86,6 +86,7 @@ class UnifiedAudioRadio(commands.Cog):
       nudges breaks, and reminds DJ to sleep (sleep reminders trigger regardless of quiet hours).
     - Resting State (anti-cheat): after g!imgoing, if DJ re-enters the locked VC during
       rest window, Grey Hair Asuka enforces rest by removing playback incentive.
+    - Grey DM-pings DJ at rest start AND when rest window ends (come back after sleeping).
 
     IMPORTANT BEHAVIOR (guard rails):
     - rrrestore = RADIO restore ONLY (last saved station) AND force-switch (stop YouTube first)
@@ -215,6 +216,9 @@ class UnifiedAudioRadio(commands.Cog):
         self._rest_note: str = ""
         self._last_rest_enforce_monotonic: float = 0.0
 
+        # Rest end notification task
+        self._rest_end_task: Optional[asyncio.Task] = None
+
     # -------------------------
     # Lavalink accessor
     # -------------------------
@@ -308,7 +312,6 @@ class UnifiedAudioRadio(commands.Cog):
         except Exception:
             try:
                 from datetime import datetime
-
                 return datetime.now()
             except Exception:
                 return None
@@ -494,6 +497,8 @@ class UnifiedAudioRadio(commands.Cog):
         for t in (self._watchdog_task, self._reassure_task):
             if t and not t.done():
                 t.cancel()
+
+        self._cancel_rest_end_task()
 
         if self._ll_registered:
             ll = self._get_lavalink()
@@ -775,95 +780,7 @@ class UnifiedAudioRadio(commands.Cog):
             )
 
     # -------------------------
-    # Rest enforcement (anti-cheat)
-    # -------------------------
-    async def _rest_active(self) -> bool:
-        return time.monotonic() < float(self._rest_until_monotonic or 0.0)
-
-    def _rest_remaining_minutes(self) -> int:
-        rem = max(0.0, float(self._rest_until_monotonic or 0.0) - time.monotonic())
-        return int((rem + 59.0) // 60.0)
-
-    async def _enforce_rest_if_needed(self, guild: discord.Guild, dj_in_allowed_vc: bool) -> None:
-        if not dj_in_allowed_vc:
-            return
-        if not await self.config.dj_rest_enabled():
-            return
-        if not await self._rest_active():
-            return
-
-        now = time.monotonic()
-        if self._last_rest_enforce_monotonic and (now - self._last_rest_enforce_monotonic) < 20.0:
-            return
-        self._last_rest_enforce_monotonic = now
-
-        mode = (await self.config.dj_rest_enforce_mode() or "leave").strip().lower()
-        rem_mins = self._rest_remaining_minutes()
-
-        self._set_grey_fatigue(max(self._grey_fatigue_level, 0.85))
-
-        if mode == "panic":
-            await self._autopanic(guild, "Rest enforcement: DJ rejoined during rest window")
-        elif mode == "stop":
-            try:
-                ll = self._get_lavalink()
-                if ll:
-                    try:
-                        p = ll.get_player(guild.id)
-                        await p.stop()
-                    except Exception:
-                        pass
-            except Exception:
-                pass
-            await self._clear_radio_state()
-            await self._clear_audio_intent()
-            await self._set_presence(None)
-        else:
-            await self._hard_stop_and_leave(guild)
-
-        msg = (
-            "no.\n"
-            "rest is locked.\n"
-            f"**{rem_mins} min** left.\n\n"
-            "dont cheat.\n"
-            "go lay down.\n"
-            "phone down.\n"
-            "pls."
-        )
-        if self._rest_note:
-            msg += f"\n\n(note: {self._rest_note})"
-
-        await self._send_to_dj(
-            guild,
-            self._grey_embed(
-                title="…hey.",
-                description=msg,
-                footer="rest window active.",
-                color=discord.Color.dark_teal(),
-            ),
-        )
-
-        if await self.config.dj_rest_notify_owner():
-            control = await self._control_channel(guild)
-            if control:
-                owner_id = await self.config.bound_owner_user_id()
-                owner_mention = f"<@{int(owner_id)}>" if owner_id else "@owner"
-                await control.send(
-                    embed=discord.Embed(
-                        title="🛌 Rest Enforcement Triggered",
-                        description=(
-                            f"{owner_mention}\n"
-                            f"DJ rejoined locked VC during rest window.\n"
-                            f"Enforcement mode: **{mode}**\n"
-                            f"Remaining: **{rem_mins} min**\n"
-                            f"Note: {self._rest_note or '—'}"
-                        ),
-                        color=discord.Color.orange(),
-                    )
-                )
-
-    # -------------------------
-    # DJ messaging
+    # DJ messaging (DM-first)
     # -------------------------
     async def _send_to_dj(self, guild: discord.Guild, embed: discord.Embed) -> None:
         dj_user_id = await self.config.dj_user_id()
@@ -873,7 +790,12 @@ class UnifiedAudioRadio(commands.Cog):
         if not member:
             return
 
-        use_dm = await self.config.reassure_use_dm()
+        use_dm = True
+        try:
+            use_dm = bool(await self.config.reassure_use_dm())
+        except Exception:
+            use_dm = True
+
         fallback_id = await self.config.reassure_fallback_channel_id()
         control_id = await self.config.control_text_channel_id()
 
@@ -894,6 +816,38 @@ class UnifiedAudioRadio(commands.Cog):
 
         try:
             await ch.send(content=member.mention, embed=embed)
+        except Exception:
+            pass
+
+    async def _send_to_owner(self, guild: discord.Guild, embed: discord.Embed) -> None:
+        """
+        Best-effort DM ping to Grey Hair Asuka (bound owner), so she's alerted even if control channel is missed.
+        """
+        owner_id = await self.config.bound_owner_user_id()
+        if not owner_id:
+            return
+
+        member = guild.get_member(int(owner_id))
+        if member is None:
+            try:
+                member = await guild.fetch_member(int(owner_id))
+            except Exception:
+                member = None
+
+        if member is None:
+            try:
+                user = self.bot.get_user(int(owner_id)) or await self.bot.fetch_user(int(owner_id))
+            except Exception:
+                user = None
+            if user:
+                try:
+                    await user.send(embed=embed)
+                except Exception:
+                    pass
+            return
+
+        try:
+            await member.send(embed=embed)
         except Exception:
             pass
 
@@ -977,6 +931,143 @@ class UnifiedAudioRadio(commands.Cog):
             )
 
         await self._send_to_dj(guild, embed)
+
+    # -------------------------
+    # Rest enforcement (anti-cheat) + rest-end ping
+    # -------------------------
+    async def _rest_active(self) -> bool:
+        return time.monotonic() < float(self._rest_until_monotonic or 0.0)
+
+    def _rest_remaining_minutes(self) -> int:
+        rem = max(0.0, float(self._rest_until_monotonic or 0.0) - time.monotonic())
+        return int((rem + 59.0) // 60.0)
+
+    def _cancel_rest_end_task(self) -> None:
+        t = getattr(self, "_rest_end_task", None)
+        if t and not t.done():
+            t.cancel()
+        self._rest_end_task = None
+
+    def _schedule_rest_end_notice(self, guild: discord.Guild, mins: int) -> None:
+        self._cancel_rest_end_task()
+
+        async def _runner():
+            try:
+                await asyncio.sleep(max(1, int(mins)) * 60)
+
+                if await self._rest_active():
+                    rem = max(0.0, float(self._rest_until_monotonic or 0.0) - time.monotonic())
+                    if rem > 0:
+                        await asyncio.sleep(rem)
+
+                # DM ping: rest ended (DJ)
+                self._set_grey_fatigue(max(self._grey_fatigue_level, 0.65))
+                await self._send_to_dj(
+                    guild,
+                    self._grey_embed(
+                        title="…hey.",
+                        description=(
+                            "ok.\n"
+                            "rest window’s done.\n"
+                            "u can come back now.\n\n"
+                            "if ur still dizzy / heavy,\n"
+                            "sleep more.\n"
+                            "im not going anywhere."
+                        ),
+                        footer="(dm ping) u can come back after sleeping.",
+                    ),
+                )
+            except asyncio.CancelledError:
+                return
+            except Exception:
+                log.exception("rest end notice task error")
+
+        self._rest_end_task = self.bot.loop.create_task(_runner())
+
+    async def _enforce_rest_if_needed(self, guild: discord.Guild, dj_in_allowed_vc: bool) -> None:
+        if not dj_in_allowed_vc:
+            return
+        if not await self.config.dj_rest_enabled():
+            return
+        if not await self._rest_active():
+            return
+
+        now = time.monotonic()
+        if self._last_rest_enforce_monotonic and (now - self._last_rest_enforce_monotonic) < 20.0:
+            return
+        self._last_rest_enforce_monotonic = now
+
+        mode = (await self.config.dj_rest_enforce_mode() or "leave").strip().lower()
+        rem_mins = self._rest_remaining_minutes()
+
+        self._set_grey_fatigue(max(self._grey_fatigue_level, 0.85))
+
+        if mode == "panic":
+            await self._autopanic(guild, "Rest enforcement: DJ rejoined during rest window")
+        elif mode == "stop":
+            try:
+                ll = self._get_lavalink()
+                if ll:
+                    try:
+                        p = ll.get_player(guild.id)
+                        await p.stop()
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+            await self._clear_radio_state()
+            await self._clear_audio_intent()
+            await self._set_presence(None)
+        else:
+            await self._hard_stop_and_leave(guild)
+
+        msg = (
+            "no.\n"
+            "rest is locked.\n"
+            f"**{rem_mins} min** left.\n\n"
+            "dont cheat.\n"
+            "go back to bed.\n"
+            "phone down.\n"
+            "pls."
+        )
+        if self._rest_note:
+            msg += f"\n\n(note: {self._rest_note})"
+
+        # DM-only enforcement notice to DJ
+        await self._send_to_dj(
+            guild,
+            self._grey_embed(
+                title="…hey.",
+                description=msg,
+                footer="rest window active.",
+                color=discord.Color.dark_teal(),
+            ),
+        )
+
+        # Alert Grey Hair Asuka (owner) + control channel so she's watching for anything
+        if await self.config.dj_rest_notify_owner():
+            control = await self._control_channel(guild)
+            owner_id = await self.config.bound_owner_user_id()
+            owner_mention = f"<@{int(owner_id)}>" if owner_id else "@owner"
+
+            embed = discord.Embed(
+                title="🛌 Rest Enforcement Triggered",
+                description=(
+                    f"{owner_mention}\n"
+                    f"DJ rejoined locked VC during rest window.\n"
+                    f"Enforcement mode: **{mode}**\n"
+                    f"Remaining: **{rem_mins} min**\n"
+                    f"Note: {self._rest_note or '—'}"
+                ),
+                color=discord.Color.orange(),
+            )
+
+            if control:
+                try:
+                    await control.send(embed=embed)
+                except Exception:
+                    pass
+            await self._send_to_owner(guild, embed)
 
     # -------------------------
     # Cog gating
@@ -1380,13 +1471,13 @@ class UnifiedAudioRadio(commands.Cog):
                                 self._grey_embed(
                                     title=title,
                                     description=desc,
-                                    footer="(break nudge) you can rest. i guard.",
+                                    footer="(break nudge) u can rest. i guard.",
                                 ),
                             )
                 else:
                     self._set_grey_fatigue(0.0)
 
-                # sleep reminders (outside quiet hours too)
+                # sleep reminders
                 if await self.config.dj_sleep_enabled():
                     if dj_in_allowed_vc and self._dj_in_vc_since_monotonic > 0.0:
                         mins_in_vc = int((now - self._dj_in_vc_since_monotonic) // 60)
@@ -2270,6 +2361,7 @@ class UnifiedAudioRadio(commands.Cog):
     async def imgoing(self, ctx: commands.Context, minutes: Optional[int] = None, *, note: str = ""):
         """
         DJ acknowledges sleep/break nudges AND activates a rest lock.
+        DM-only acknowledgement to DJ (no in-channel acknowledgement).
         Usage:
           g!imgoing
           g!imgoing 90
@@ -2296,43 +2388,57 @@ class UnifiedAudioRadio(commands.Cog):
         self._rest_note = (note or "").strip()[:200]
         self._dj_sleep_stage = 0
 
-        self._set_grey_fatigue(max(self._grey_fatigue_level, 0.75))
+        self._set_grey_fatigue(max(self._grey_fatigue_level, 0.80))
 
-        await ctx.send(
-            embed=self._grey_embed(
+        # DM ping at rest start (DJ) — DM-only
+        await self._send_to_dj(
+            ctx.guild,
+            self._grey_embed(
                 title="…good.",
                 description=(
                     "ok.\n"
-                    "go rest.\n"
-                    "for real.\n\n"
+                    "go sleep.\n"
+                    "like. actually.\n\n"
                     f"rest lock: **{mins} min**.\n"
-                    "if u come back,\n"
+                    "when u wake up,\n"
+                    "u can come back.\n"
+                    "i’ll be here.\n\n"
+                    "if u come back early,\n"
                     "i cut the music.\n"
                     "no cheating."
                     + (f"\n\n(note: {self._rest_note})" if self._rest_note else "")
                 ),
-                footer="rest lock armed.",
-            )
+                footer="(dm ping) sleep first. then come back.",
+            ),
         )
 
+        # Notify Grey Hair Asuka (owner) so she can react if anything happens
         if await self.config.dj_rest_notify_owner():
             control = await self._control_channel(ctx.guild)
+            owner_id = await self.config.bound_owner_user_id()
+            owner_mention = f"<@{int(owner_id)}>" if owner_id else "@owner"
+
+            embed = discord.Embed(
+                title="🛌 Rest Lock Armed",
+                description=(
+                    f"{owner_mention}\n"
+                    f"DJ activated rest lock via `g!imgoing`.\n"
+                    f"Duration: **{mins} min**\n"
+                    f"Enforce mode: **{(await self.config.dj_rest_enforce_mode()) or 'leave'}**\n"
+                    f"Note: {self._rest_note or '—'}"
+                ),
+                color=discord.Color.green(),
+            )
+
             if control:
-                owner_id = await self.config.bound_owner_user_id()
-                owner_mention = f"<@{int(owner_id)}>" if owner_id else "@owner"
-                await control.send(
-                    embed=discord.Embed(
-                        title="🛌 Rest Lock Armed",
-                        description=(
-                            f"{owner_mention}\n"
-                            f"DJ activated rest lock via `g!imgoing`.\n"
-                            f"Duration: **{mins} min**\n"
-                            f"Enforce mode: **{(await self.config.dj_rest_enforce_mode()) or 'leave'}**\n"
-                            f"Note: {self._rest_note or '—'}"
-                        ),
-                        color=discord.Color.green(),
-                    )
-                )
+                try:
+                    await control.send(embed=embed)
+                except Exception:
+                    pass
+            await self._send_to_owner(ctx.guild, embed)
+
+        # schedule automatic “you can come back” DM ping (DJ)
+        self._schedule_rest_end_notice(ctx.guild, mins)
 
 
 async def setup(bot):
