@@ -93,6 +93,11 @@ class UnifiedAudioRadio(commands.Cog):
     - rrunlock default is SAFE: clears panic + homes ONLY (NO auto-resume)
       * rrunlock resume / full = clears panic + homes + resumes from panic snapshot/memory
       * rrunlock radio = clears panic + homes + restores last saved radio station (safe fallback)
+
+    REBIND / SERVER MOVE:
+    - rrbind = binds VC+control channel inside current server
+    - rrcontrol = moves ONLY the control channel (requires being in locked VC)
+    - rrmove / rrmigrate = rebinds to a NEW server (guild) using current text channel + your current VC
     """
 
     AUDIO_SUMMON_ALIASES: Set[str] = {"summon", "join", "connect"}
@@ -573,6 +578,17 @@ class UnifiedAudioRadio(commands.Cog):
                 await disc()
             except Exception:
                 pass
+
+    async def _disconnect_all_voice_clients(self) -> None:
+        """Best-effort: disconnect the bot from ANY guild voice it might be in."""
+        try:
+            for vc in list(getattr(self.bot, "voice_clients", []) or []):
+                try:
+                    await self._vc_disconnect(vc)
+                except Exception:
+                    pass
+        except Exception:
+            pass
 
     def _player_is_playing(self, guild: discord.Guild) -> bool:
         p = guild.voice_client
@@ -1094,7 +1110,8 @@ class UnifiedAudioRadio(commands.Cog):
         if not is_owner:
             return False
 
-        prebind_ok = {"rrbind", "rrstatus"}
+        # Allow bind/move before bound
+        prebind_ok = {"rrbind", "rrstatus", "rrmove", "rrmigrate", "rrrebindex"}
         if not await self.config.bound():
             if cmd in prebind_ok:
                 return True
@@ -1102,11 +1119,25 @@ class UnifiedAudioRadio(commands.Cog):
             return False
 
         allowed_guild_id = await self.config.allowed_guild_id()
+        # Allow server migration even if currently bound to another guild
         if allowed_guild_id and ctx.guild.id != int(allowed_guild_id):
+            if cmd in {"rrmove", "rrmigrate", "rrrebindex"}:
+                return True
             await self._audit_security(ctx.guild, f"Denied: wrong guild ({ctx.guild.id})")
             return False
 
-        bypass_control = {"rrcontrol", "rrstatus", "rrpanic", "rrunlock", "rrresume", "rrsuspend", "rrhard"}
+        bypass_control = {
+            "rrcontrol",
+            "rrstatus",
+            "rrpanic",
+            "rrunlock",
+            "rrresume",
+            "rrsuspend",
+            "rrhard",
+            "rrmove",
+            "rrmigrate",
+            "rrrebindex",
+        }
         control_id = await self.config.control_text_channel_id()
         if control_id and ctx.channel.id != int(control_id):
             if cmd not in bypass_control:
@@ -1114,7 +1145,7 @@ class UnifiedAudioRadio(commands.Cog):
                 return False
 
         if await self.config.panic_locked():
-            panic_ok = {"rrstatus", "rrunlock", "rrpanic", "rrcontrol", "rrhard"}
+            panic_ok = {"rrstatus", "rrunlock", "rrpanic", "rrcontrol", "rrhard", "rrmove", "rrmigrate", "rrrebindex"}
             if cmd in panic_ok:
                 return True
             await ctx.send("Panic lock is active.")
@@ -1713,7 +1744,7 @@ class UnifiedAudioRadio(commands.Cog):
         )
 
         embed.set_footer(
-            text="Commands: rrstatus | rrpanic | rrunlock [home|resume|full|radio] | rrrestore | rrsuspend | rrresume | rrhard"
+            text="Commands: rrstatus | rrbind | rrcontrol | rrmove | rrpanic | rrunlock [home|resume|full|radio] | rrrestore | rrsuspend | rrresume | rrhard"
         )
         await ctx.send(embed=embed)
 
@@ -1982,6 +2013,82 @@ class UnifiedAudioRadio(commands.Cog):
         await self._set_presence(None)
 
         await ctx.send("Bound. Use rrsetdj to set DJ Asuka. Use rrhome to bring her home.")
+
+    @commands.guild_only()
+    @commands.is_owner()
+    @commands.command(name="rrmove", aliases=["rrmigrate", "rrrebindex"])
+    async def rrmove(self, ctx: commands.Context, *, note: str = ""):
+        """
+        Rebind this cog to the CURRENT server (guild), using:
+        - current text channel as new control channel
+        - your current voice channel as the new locked VC
+
+        This is the "change bound server" escape hatch.
+        Usage:
+          g!rrmove
+          g!rrmove moving to new server
+        """
+        if ctx.guild is None:
+            return
+
+        # Must be in the VC you want to lock.
+        if not ctx.author.voice or not ctx.author.voice.channel:
+            await ctx.send("Join the voice channel you want locked first, then run `rrmove` again.")
+            return
+
+        # HARD SAFETY: stop/leave everywhere before migrating.
+        await self._disconnect_all_voice_clients()
+        await self._clear_radio_state()
+        await self._clear_audio_intent()
+        await self._set_presence(None)
+
+        # Clear safety locks so you can operate immediately in the new guild.
+        await self.config.panic_locked.set(False)
+        await self.config.autopanic_reason.set(None)
+        await self.config.autopanic_enabled.set(True)
+        await self._unsuspend()
+
+        # Re-key perimeter to this guild + channels.
+        await self.config.allowed_guild_id.set(ctx.guild.id)
+        await self.config.control_text_channel_id.set(ctx.channel.id)
+        await self.config.allowed_voice_channel_id.set(ctx.author.voice.channel.id)
+        await self.config.bound_owner_user_id.set(ctx.author.id)
+        await self.config.bound.set(True)
+
+        # If they haven't set a fallback, use the new control room.
+        if not await self.config.reassure_fallback_channel_id():
+            await self.config.reassure_fallback_channel_id.set(ctx.channel.id)
+
+        # Grace windows so summon/home transitions don't trip safeguards immediately.
+        now = time.monotonic()
+        self._allow_summon_until = now + SUMMON_GRACE_SECONDS
+        self._home_grace_until = now + HOME_GRACE_SECONDS
+
+        # Best-effort audit in the *new* guild.
+        try:
+            msg = f"Server rebind/migrate executed by {ctx.author} ({ctx.author.id})."
+            if note.strip():
+                msg += f" Note: {note.strip()[:200]}"
+            await self._audit_security(ctx.guild, msg)
+        except Exception:
+            pass
+
+        embed = discord.Embed(
+            title="🔁 Rebound to New Server",
+            description=(
+                "ok.\n"
+                "i moved the perimeter.\n\n"
+                f"**Guild:** {ctx.guild.name} (`{ctx.guild.id}`)\n"
+                f"**Control channel:** {ctx.channel.mention}\n"
+                f"**Locked VC:** {ctx.author.voice.channel.mention}\n\n"
+                "next:\n"
+                "- `rrsetdj @DJAsuka` (if needed in this server)\n"
+                "- `rrhome` to bring her in\n"
+            ),
+            color=discord.Color.green(),
+        )
+        embed.set_footer(text="Grey Hair Asuka protocol: relocation / re-key.")
+        await ctx.send(embed=embed)
 
     @commands.is_owner()
     @commands.command()
