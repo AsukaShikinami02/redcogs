@@ -1,0 +1,11 @@
+{
+  "author": ["you"],
+  "name": "RunapurOnline",
+  "short": "GTA Online-style Runapur economy game with heat, heists, bounties, jail, and businesses.",
+  "description": "A Runapur (Black Lagoon) themed GTA Online-like loop using Red's Bank + Config. Includes hustle jobs, bounties, heists, wanted/heat, jail, items, businesses, and leaderboards.",
+  "install_msg": "Loaded. Try: [p]runapur start  |  [p]runapur hustle  |  [p]runapur heist",
+  "requirements": [],
+  "tags": ["game", "economy", "runapur", "roleplay", "gta"],
+  "min_bot_version": "3.5.0",
+  "end_user_data_statement": "This cog stores per-user game stats (heat, jail timer, businesses, inventory, cooldown timestamps) using Red's Config."
+}
